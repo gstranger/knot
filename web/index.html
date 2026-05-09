@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Knot Kernel — WASM Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; }
+    header { padding: 16px 32px; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header span { color: #888; font-size: 14px; }
+    .panels { display: flex; gap: 0; height: calc(100vh - 53px); }
+    .panel { flex: 1; padding: 20px; border-right: 1px solid #333; overflow-y: auto; }
+    .panel:last-child { border-right: none; }
+    .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
+    canvas { width: 100%; background: #0f0f23; border-radius: 6px; cursor: crosshair; }
+    .controls { margin-top: 12px; }
+    .controls label { display: block; margin-bottom: 6px; font-size: 12px; color: #aaa; }
+    .controls input[type=range] { width: 100%; }
+    .controls select { background: #222; color: #eee; border: 1px solid #555; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+    .info { margin-top: 12px; font-size: 11px; color: #666; line-height: 1.5; }
+    .info code { color: #8be9fd; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Knot Kernel</h1>
+    <span id="ver"></span>
+  </header>
+  <div class="panels">
+    <!-- Panel 1: NURBS Curve -->
+    <div class="panel">
+      <h2>NURBS Curve</h2>
+      <canvas id="curve-canvas" width="400" height="350"></canvas>
+      <div class="controls">
+        <label>CP Y: <input type="range" id="cp-y" min="-2" max="2" step="0.05" value="1"></label>
+        <label>Weight: <input type="range" id="cp-w" min="0.1" max="5" step="0.1" value="1"></label>
+      </div>
+    </div>
+    <!-- Panel 2: Primitives -->
+    <div class="panel">
+      <h2>BRep Primitives</h2>
+      <canvas id="brep-canvas" width="400" height="350"></canvas>
+      <div class="controls">
+        <label>Shape:
+          <select id="shape-select">
+            <option value="box">Box</option>
+            <option value="cylinder">Cylinder</option>
+            <option value="sphere">Sphere</option>
+          </select>
+        </label>
+        <label>Size: <input type="range" id="shape-size" min="0.5" max="3" step="0.1" value="1.5"></label>
+      </div>
+      <div class="info">Faces: <code id="brep-faces">-</code> | Tris: <code id="brep-tris">-</code></div>
+    </div>
+    <!-- Panel 3: Boolean -->
+    <div class="panel">
+      <h2>Boolean Operations</h2>
+      <canvas id="bool-canvas" width="400" height="350"></canvas>
+      <div class="controls">
+        <label>Operation:
+          <select id="bool-op">
+            <option value="union">Union (A + B)</option>
+            <option value="intersection">Intersection (A & B)</option>
+            <option value="subtraction">Subtraction (A - B)</option>
+          </select>
+        </label>
+        <label>Offset X: <input type="range" id="bool-offset" min="0" max="2" step="0.05" value="0.7"></label>
+      </div>
+      <div class="info">
+        A = blue box, B = offset box. Result rendered.
+        <br>Faces: <code id="bool-faces">-</code> | Tris: <code id="bool-tris">-</code>
+        <br><code id="bool-time"></code>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, {
+      version,
+      create_nurbs_curve,
+      create_box,
+      create_sphere_brep,
+      create_cylinder_brep,
+      boolean_union,
+      boolean_intersection,
+      boolean_subtraction,
+    } from '../pkg/knot.js';
+
+    await init();
+    document.getElementById('ver').textContent = `v${version()}`;
+
+    // ─── Shared renderer ───
+
+    function renderMesh(ctx, w, h, mesh, time) {
+      const positions = mesh.positions();
+      const normals = mesh.normals();
+      const indices = mesh.indices();
+
+      ctx.clearRect(0, 0, w, h);
+
+      const cosA = Math.cos(time), sinA = Math.sin(time);
+      const cosB = Math.cos(0.5), sinB = Math.sin(0.5);
+      const scale = w / 5;
+      const cx = w / 2, cy = h / 2;
+
+      const project = (x, y, z) => {
+        const x1 = x * cosA + z * sinA;
+        const z1 = -x * sinA + z * cosA;
+        const y1 = y * cosB - z1 * sinB;
+        const z2 = y * sinB + z1 * cosB;
+        return [cx + x1 * scale, cy - y1 * scale, z2];
+      };
+
+      const triangles = [];
+      for (let i = 0; i < indices.length; i += 3) {
+        const i0 = indices[i]*3, i1 = indices[i+1]*3, i2 = indices[i+2]*3;
+        const [ax,ay,az] = project(positions[i0], positions[i0+1], positions[i0+2]);
+        const [bx,by,bz] = project(positions[i1], positions[i1+1], positions[i1+2]);
+        const [pcx,pcy,cz2] = project(positions[i2], positions[i2+1], positions[i2+2]);
+        const nx = normals[i0], ny = normals[i0+1], nz = normals[i0+2];
+        const nx1 = nx * cosA + nz * sinA;
+        const nz1 = -nx * sinA + nz * cosA;
+        const ny1 = ny * cosB - nz1 * sinB;
+        const light = Math.max(0.05, nx1 * 0.4 + ny1 * 0.6 + 0.4);
+        triangles.push({ ax, ay, bx, by, cx: pcx, cy: pcy, depth: (az+bz+cz2)/3, light });
+      }
+      triangles.sort((a, b) => a.depth - b.depth);
+
+      for (const t of triangles) {
+        const r = Math.floor(30 + t.light * 80);
+        const g = Math.floor(60 + t.light * 150);
+        const b2 = Math.floor(100 + t.light * 155);
+        ctx.fillStyle = `rgb(${r},${g},${b2})`;
+        ctx.strokeStyle = `rgba(255,255,255,0.06)`;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(t.ax, t.ay);
+        ctx.lineTo(t.bx, t.by);
+        ctx.lineTo(t.cx, t.cy);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      mesh.free();
+    }
+
+    // ─── Panel 1: Curve ───
+
+    const curveCanvas = document.getElementById('curve-canvas');
+    const cctx = curveCanvas.getContext('2d');
+
+    function drawCurve() {
+      const w = curveCanvas.width, h = curveCanvas.height;
+      const midY = parseFloat(document.getElementById('cp-y').value);
+      const midW = parseFloat(document.getElementById('cp-w').value);
+      const cp = new Float64Array([0,0,0, 0.5,midY,0, 1,0,0]);
+      const weights = new Float64Array([1, midW, 1]);
+      const knots = new Float64Array([0,0,0, 1,1,1]);
+      let curve;
+      try { curve = create_nurbs_curve(cp, weights, knots, 2); } catch(e) { return; }
+      const samples = curve.sample(200);
+      const controlPts = curve.control_points();
+      cctx.clearRect(0, 0, w, h);
+      const tx = x => 40 + x * (w - 80);
+      const ty = y => h / 2 - y * (h / 5);
+      cctx.strokeStyle = '#444'; cctx.lineWidth = 1; cctx.setLineDash([4,4]);
+      cctx.beginPath();
+      for (let i = 0; i < controlPts.length; i += 3)
+        i === 0 ? cctx.moveTo(tx(controlPts[i]), ty(controlPts[i+1])) : cctx.lineTo(tx(controlPts[i]), ty(controlPts[i+1]));
+      cctx.stroke(); cctx.setLineDash([]);
+      cctx.strokeStyle = '#8be9fd'; cctx.lineWidth = 2.5; cctx.beginPath();
+      for (let i = 0; i < samples.length; i += 3)
+        i === 0 ? cctx.moveTo(tx(samples[i]), ty(samples[i+1])) : cctx.lineTo(tx(samples[i]), ty(samples[i+1]));
+      cctx.stroke();
+      for (let i = 0; i < controlPts.length; i += 3) {
+        cctx.fillStyle = i === 3 ? '#ff79c6' : '#f8f8f2';
+        cctx.beginPath(); cctx.arc(tx(controlPts[i]), ty(controlPts[i+1]), 5, 0, Math.PI*2); cctx.fill();
+      }
+      cctx.fillStyle = '#888'; cctx.font = '11px monospace';
+      cctx.fillText(`w=${midW.toFixed(1)}`, tx(0.5)+10, ty(midY)-10);
+      curve.free();
+    }
+    document.getElementById('cp-y').addEventListener('input', drawCurve);
+    document.getElementById('cp-w').addEventListener('input', drawCurve);
+    drawCurve();
+
+    // ─── Panel 2: Primitives ───
+
+    const brepCanvas = document.getElementById('brep-canvas');
+    const bctx = brepCanvas.getContext('2d');
+
+    function drawBrep(time) {
+      const size = parseFloat(document.getElementById('shape-size').value);
+      const shape = document.getElementById('shape-select').value;
+      let brep;
+      try {
+        if (shape === 'box') brep = create_box(size, size, size);
+        else if (shape === 'cylinder') brep = create_cylinder_brep(0,0,0, size*0.5, size, 24);
+        else brep = create_sphere_brep(0,0,0, size*0.7, 16, 8);
+      } catch(e) { return; }
+      document.getElementById('brep-faces').textContent = brep.face_count();
+      const mesh = brep.tessellate();
+      document.getElementById('brep-tris').textContent = mesh.triangle_count();
+      renderMesh(bctx, brepCanvas.width, brepCanvas.height, mesh, time);
+      brep.free();
+    }
+    document.getElementById('shape-select').addEventListener('change', () => drawBrep(Date.now()/2000));
+    document.getElementById('shape-size').addEventListener('input', () => drawBrep(Date.now()/2000));
+
+    // ─── Panel 3: Boolean ───
+
+    const boolCanvas = document.getElementById('bool-canvas');
+    const boolCtx = boolCanvas.getContext('2d');
+
+    function drawBool(time) {
+      const offset = parseFloat(document.getElementById('bool-offset').value);
+      const opName = document.getElementById('bool-op').value;
+      const t0 = performance.now();
+
+      let a, b, result;
+      try {
+        a = create_box(2, 2, 2);
+        b = create_box(2, 2, 2);  // same size, we'll need to offset
+
+        // Since we can't translate BReps directly yet, create an offset box manually
+        // by making a box primitive and using boolean — but we need offset construction.
+        // For now, just use two boxes of different sizes to demonstrate.
+        b.free();
+        // Create offset box by making a larger one and shifting via the primitive
+        // Actually, let's use the boolean with boxes at the origin vs shifted:
+        // We'll create the second box at an offset position using the bindings.
+
+        // Workaround: use cylinder as the second shape for visual variety
+        b = create_cylinder_brep(offset, 0, 0, 0.8, 3, 16);
+
+        if (opName === 'union') result = boolean_union(a, b);
+        else if (opName === 'intersection') result = boolean_intersection(a, b);
+        else result = boolean_subtraction(a, b);
+      } catch(e) {
+        boolCtx.clearRect(0, 0, boolCanvas.width, boolCanvas.height);
+        boolCtx.fillStyle = '#ff5555';
+        boolCtx.font = '12px monospace';
+        boolCtx.fillText(e.message || 'Error', 10, 30);
+        if (a) a.free();
+        if (b) b.free();
+        return;
+      }
+
+      const dt = performance.now() - t0;
+      document.getElementById('bool-faces').textContent = result.face_count();
+      const mesh = result.tessellate();
+      document.getElementById('bool-tris').textContent = mesh.triangle_count();
+      document.getElementById('bool-time').textContent = `${dt.toFixed(1)}ms`;
+
+      renderMesh(boolCtx, boolCanvas.width, boolCanvas.height, mesh, time);
+      a.free(); b.free(); result.free();
+    }
+    document.getElementById('bool-op').addEventListener('change', () => drawBool(Date.now()/2000));
+    document.getElementById('bool-offset').addEventListener('input', () => drawBool(Date.now()/2000));
+
+    // ─── Animation loop ───
+
+    function animate() {
+      const time = Date.now() / 2000;
+      drawBrep(time);
+      drawBool(time);
+      requestAnimationFrame(animate);
+    }
+    animate();
+  </script>
+</body>
+</html>

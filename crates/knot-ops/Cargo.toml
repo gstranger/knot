@@ -1,0 +1,16 @@
+[package]
+name = "knot-ops"
+version = "0.1.0"
+edition = "2024"
+description = "Modeling operations for the Knot CAD kernel"
+
+[dependencies]
+knot-core = { path = "../knot-core" }
+knot-geom = { path = "../knot-geom" }
+knot-topo = { path = "../knot-topo" }
+knot-intersect = { path = "../knot-intersect" }
+nalgebra = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+knot-tessellate = { path = "../knot-tessellate" }

@@ -1,0 +1,12 @@
+[package]
+name = "knot-intersect"
+version = "0.1.0"
+edition = "2024"
+description = "Intersection algorithms for the Knot CAD kernel"
+
+[dependencies]
+knot-core = { path = "../knot-core" }
+knot-geom = { path = "../knot-geom" }
+malachite-base = "0.4"
+malachite-q = { workspace = true }
+nalgebra = { workspace = true }

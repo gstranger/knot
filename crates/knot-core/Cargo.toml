@@ -1,0 +1,13 @@
+[package]
+name = "knot-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core types for the Knot CAD kernel"
+
+[dependencies]
+nalgebra = { workspace = true }
+malachite-base = "0.4"
+malachite-q = { workspace = true }
+malachite-nz = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

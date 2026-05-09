@@ -1,0 +1,10 @@
+[package]
+name = "knot-geom"
+version = "0.1.0"
+edition = "2024"
+description = "Geometry primitives for the Knot CAD kernel"
+
+[dependencies]
+knot-core = { path = "../knot-core" }
+nalgebra = { workspace = true }
+serde = { workspace = true }

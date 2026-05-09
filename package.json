@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "scripts": {
+    "build:wasm": "wasm-pack build --target web --out-dir pkg && node scripts/fix-pkg-name.mjs",
+    "build:js": "pnpm --filter knot-cad build",
+    "build": "pnpm run build:wasm && pnpm run build:js"
+  }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "knot-topo"
+version = "0.1.0"
+edition = "2024"
+description = "BREP topology for the Knot CAD kernel"
+
+[dependencies]
+knot-core = { path = "../knot-core" }
+knot-geom = { path = "../knot-geom" }
+nalgebra = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,5 @@
+/target
+/data
+/pkg
+node_modules/
+js/dist/

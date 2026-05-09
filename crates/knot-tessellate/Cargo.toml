@@ -1,0 +1,14 @@
+[package]
+name = "knot-tessellate"
+version = "0.1.0"
+edition = "2024"
+description = "Tessellation for the Knot CAD kernel"
+
+[dependencies]
+knot-core = { path = "../knot-core" }
+knot-geom = { path = "../knot-geom" }
+knot-topo = { path = "../knot-topo" }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+knot-ops = { path = "../knot-ops" }
