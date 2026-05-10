@@ -21,4 +21,12 @@
 pub mod poly;
 pub mod bernstein;
 pub mod quartic;
+pub mod univariate;
+pub mod discriminant;
+pub mod branch_topology;
+pub mod nurbs_bridge;
+pub mod analytic_subst;
+pub mod nurbs_analytic;
+pub mod nurbs_nurbs;
 pub mod cylinder_torus;
+pub mod cone_torus;

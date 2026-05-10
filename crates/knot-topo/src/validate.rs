@@ -1,12 +1,25 @@
 use std::collections::HashMap;
 use knot_core::{KResult, KernelError, ErrorCode, SnapGrid};
 use knot_core::snap::LatticeIndex;
+use knot_core::bbox::Aabb3;
+use nalgebra::Point3;
 use super::brep::BRep;
 use super::shell::Shell;
 
-/// Default grid resolution for validation.
-/// Uses a fine grid to catch small deviations.
-const VALIDATE_GRID_RESOLUTION: f64 = 1e-10;
+/// Validation grid resolution as a fraction of the model's bbox
+/// diagonal. Two vertex points within `bbox_diag * VALIDATE_GRID_RELATIVE`
+/// of each other are treated as the same vertex.
+///
+/// Sized to absorb STEP-precision drift (typically 1e-6 to 1e-7
+/// relative on coordinates written by CAD exporters) while staying
+/// far below feature size. Matches the boolean's tolerance scale so
+/// vertex-identity decisions agree across the kernel.
+const VALIDATE_GRID_RELATIVE: f64 = 1e-7;
+
+/// Lower bound on cell size in absolute units. Used when the model
+/// bbox is empty/degenerate so vertices still get a deterministic
+/// lattice key.
+const VALIDATE_GRID_FLOOR: f64 = 1e-12;
 
 /// Validate a BRep for topological consistency.
 ///
@@ -22,17 +35,38 @@ const VALIDATE_GRID_RESOLUTION: f64 = 1e-10;
 /// 4. Edge-use counting: in a closed shell, every edge is used exactly 2 times
 /// 5. Euler-Poincare formula
 pub fn validate_brep(brep: &BRep) -> KResult<()> {
+    let grid = grid_for_brep(brep);
     for solid in brep.solids() {
-        validate_shell(solid.outer_shell(), true)?;
+        validate_shell(solid.outer_shell(), true, &grid)?;
         for void in solid.void_shells() {
-            validate_shell(void, true)?;
+            validate_shell(void, true, &grid)?;
         }
     }
     Ok(())
 }
 
-fn validate_shell(shell: &Shell, require_closed: bool) -> KResult<()> {
-    let grid = SnapGrid::new(VALIDATE_GRID_RESOLUTION);
+fn grid_for_brep(brep: &BRep) -> SnapGrid {
+    let mut pts: Vec<Point3<f64>> = Vec::new();
+    for solid in brep.solids() {
+        for face in solid.outer_shell().faces() {
+            for he in face.outer_loop().half_edges() {
+                pts.push(*he.start_vertex().point());
+            }
+            for inner in face.inner_loops() {
+                for he in inner.half_edges() {
+                    pts.push(*he.start_vertex().point());
+                }
+            }
+        }
+    }
+    let diag = Aabb3::from_points(&pts)
+        .map(|b| b.diagonal_length())
+        .unwrap_or(0.0);
+    let cell = (diag * VALIDATE_GRID_RELATIVE).max(VALIDATE_GRID_FLOOR);
+    SnapGrid::new(cell)
+}
+
+fn validate_shell(shell: &Shell, require_closed: bool, grid: &SnapGrid) -> KResult<()> {
 
     for (fi, face) in shell.faces().iter().enumerate() {
         // Check 1: minimum edge count.
@@ -63,32 +97,38 @@ fn validate_shell(shell: &Shell, require_closed: bool) -> KResult<()> {
             }
         }
 
-        // Check 3: edge-vertex geometry consistency via lattice index
+        // Check 3: edge-vertex geometry consistency.
+        // STEP-derived curves and vertex points are written to limited
+        // precision (typically ~1e-6 relative), so we compare with a
+        // coarser tolerance than the vertex/edge identity grid. The
+        // strict lattice grid is used for "are these the same vertex"
+        // decisions; this check only verifies "does the curve roughly
+        // pass through the vertex." The tolerance is 100× the grid
+        // cell size — the same multiplier the boolean uses elsewhere.
+        let consistency_tol = grid.cell_size * 100.0;
         for (ei, he) in hes.iter().enumerate() {
             let edge = he.edge();
             let curve_start = edge.curve().point_at(knot_geom::curve::CurveParam(edge.t_start()));
             let curve_end = edge.curve().point_at(knot_geom::curve::CurveParam(edge.t_end()));
 
-            let curve_start_li = grid.lattice_index(curve_start);
-            let curve_end_li = grid.lattice_index(curve_end);
-            let vert_start_li = grid.lattice_index(*edge.start().point());
-            let vert_end_li = grid.lattice_index(*edge.end().point());
+            let d_start = (curve_start - *edge.start().point()).norm();
+            let d_end = (curve_end - *edge.end().point()).norm();
 
-            if curve_start_li != vert_start_li {
+            if d_start > consistency_tol {
                 return Err(KernelError::TopoInconsistency {
                     code: ErrorCode::DanglingReference,
                     detail: format!(
-                        "face {} edge {}: curve start lattice {:?} != vertex lattice {:?}",
-                        fi, ei, curve_start_li, vert_start_li
+                        "face {} edge {}: curve start {:.3e} from vertex (tol {:.3e})",
+                        fi, ei, d_start, consistency_tol
                     ),
                 });
             }
-            if curve_end_li != vert_end_li {
+            if d_end > consistency_tol {
                 return Err(KernelError::TopoInconsistency {
                     code: ErrorCode::DanglingReference,
                     detail: format!(
-                        "face {} edge {}: curve end lattice {:?} != vertex lattice {:?}",
-                        fi, ei, curve_end_li, vert_end_li
+                        "face {} edge {}: curve end {:.3e} from vertex (tol {:.3e})",
+                        fi, ei, d_end, consistency_tol
                     ),
                 });
             }

@@ -29,6 +29,7 @@ pub enum ErrorCode {
     SelfIntersecting = 401,
     UnsupportedConfiguration = 402,
     HistoryConflict = 403,
+    OperationTimeout = 404,
 
     // Input errors 5xx
     MalformedInput = 500,

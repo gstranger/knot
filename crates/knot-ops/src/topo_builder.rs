@@ -20,18 +20,25 @@ use knot_topo::*;
 /// `Arc<Vertex>`. Same lattice endpoint pair = same `Arc<Edge>`. This ensures
 /// that when two faces share a boundary (e.g. at an intersection curve), they
 /// reference the same underlying edge with opposite half-edge orientations.
+///
+/// Uses `BTreeMap` rather than `HashMap` for deterministic iteration
+/// order — std's `HashMap` randomizes its hasher seed per process,
+/// which causes the boolean's downstream behavior (face-splitting
+/// order, classification ordering) to vary run-to-run on the same
+/// inputs. The lattice-index keys have a natural total order so
+/// BTreeMap is the right structure here.
 pub struct TopologyBuilder {
     grid: SnapGrid,
-    vertex_cache: HashMap<LatticeIndex, Arc<Vertex>>,
-    edge_cache: HashMap<(LatticeIndex, LatticeIndex), Arc<Edge>>,
+    vertex_cache: std::collections::BTreeMap<LatticeIndex, Arc<Vertex>>,
+    edge_cache: std::collections::BTreeMap<(LatticeIndex, LatticeIndex), Arc<Edge>>,
 }
 
 impl TopologyBuilder {
     pub fn new(grid: SnapGrid) -> Self {
         Self {
             grid,
-            vertex_cache: HashMap::new(),
-            edge_cache: HashMap::new(),
+            vertex_cache: std::collections::BTreeMap::new(),
+            edge_cache: std::collections::BTreeMap::new(),
         }
     }
 

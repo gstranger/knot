@@ -130,14 +130,14 @@ fn rat(v: f64) -> Rational {
 
 /// Build a local coordinate frame for the torus:
 /// origin at torus center, z-axis along torus axis.
-struct LocalFrame {
+pub(crate) struct LocalFrame {
     origin: Point3,
     u: Vector3, // local x
     v: Vector3, // local y
     w: Vector3, // local z (= torus axis)
 }
 
-fn torus_local_frame(torus: &Torus) -> LocalFrame {
+pub(crate) fn torus_local_frame(torus: &Torus) -> LocalFrame {
     let w = torus.axis.normalize();
     let u = if torus.ref_direction.cross(&w).norm() > 1e-12 {
         (torus.ref_direction - w * torus.ref_direction.dot(&w)).normalize()
@@ -151,12 +151,12 @@ fn torus_local_frame(torus: &Torus) -> LocalFrame {
 }
 
 impl LocalFrame {
-    fn transform_point(&self, p: &Point3) -> Point3 {
+    pub(crate) fn transform_point(&self, p: &Point3) -> Point3 {
         let d = p - self.origin;
         Point3::new(d.dot(&self.u), d.dot(&self.v), d.dot(&self.w))
     }
 
-    fn transform_vector(&self, v: &Vector3) -> Vector3 {
+    pub(crate) fn transform_vector(&self, v: &Vector3) -> Vector3 {
         Vector3::new(v.dot(&self.u), v.dot(&self.v), v.dot(&self.w))
     }
 }
@@ -193,43 +193,11 @@ pub fn intersect_cylinder_torus(
         return Ok(Vec::new()); // degenerate — no v dependence
     }
 
-    // Step 3-4: Sample s over a range and use Ferrari to find v-roots at each s.
-    // For the walking skeleton, we skip the discriminant/topology determination
-    // and just sample densely, using Ferrari at each sample point.
-    // Branch continuity is tracked by nearest-neighbor sorting between
-    // consecutive s-values.
-    //
-    // s = tan(θ/2) ranges over all reals for θ ∈ (-π, π).
-    // For practical purposes, sample s ∈ [-20, 20] which covers θ ∈ (-174°, 174°).
-    // The gap near θ=±π (s→±∞) is handled by also sampling at large |s|.
-
+    // Use discriminant-based topology for reliable branch tracing.
     let s_range = 20.0;
-    let n_samples = 200;
-    let ds = 2.0 * s_range / n_samples as f64;
-
-    // At each s, evaluate the quartic coefficients and solve
-    let mut all_roots: Vec<(f64, Vec<f64>)> = Vec::new(); // (s_value, sorted v-roots)
-
-    for i in 0..=n_samples {
-        let s = -s_range + ds * i as f64;
-        let quartic_coeffs = eval_quartic_at_s(&v_coeffs, s);
-        let roots = super::quartic::solve_quartic(&quartic_coeffs);
-        // Filter to reasonable v range
-        let filtered: Vec<f64> = roots.into_iter()
-            .filter(|v| *v >= cyl.v_min - tolerance && *v <= cyl.v_max + tolerance)
-            .collect();
-        if !filtered.is_empty() {
-            all_roots.push((s, filtered));
-        }
-    }
-
-    if all_roots.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Step 5: Assemble branches by tracking root continuity.
-    // Between consecutive s-samples, match roots by nearest-neighbor.
-    let branches = assemble_branches(&all_roots, tolerance);
+    let branches = super::discriminant::trace_branches_with_topology(
+        &v_coeffs, s_range, cyl.v_min, cyl.v_max, tolerance,
+    );
 
     // Step 6: Convert (s, v) points to 3D and build traces.
     let frame = torus_local_frame(torus);
@@ -298,7 +266,7 @@ fn eval_quartic_at_s(v_coeffs: &[(u32, BiPoly)], s: f64) -> [f64; 5] {
 ///
 /// Each branch is a sequence of (s, v) pairs tracing one continuous
 /// root of the quartic as s varies.
-fn assemble_branches(
+pub(crate) fn assemble_branches(
     all_roots: &[(f64, Vec<f64>)],
     tolerance: f64,
 ) -> Vec<Vec<(f64, f64)>> {

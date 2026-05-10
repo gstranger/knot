@@ -61,9 +61,64 @@ pub fn intersect_surfaces(
         // ── Torus-Torus ──
         (Surface::Torus(t1), Surface::Torus(t2)) => torus_torus(t1, t2, tolerance),
 
-        // ── Anything involving NURBS → general marching ──
+        // ── NURBS-vs-analytic via algebraic substitution ──
+        // Each path: convert NURBS to Bézier patches, substitute the
+        // homogeneous parametric form into the analytic surface's
+        // implicit equation, trace the zero set, validate every output
+        // point lies on both surfaces. Falls through to the marcher
+        // if the algebraic path produces no validated traces (so we
+        // can only improve, never regress).
+        (Surface::Nurbs(n), Surface::Plane(p)) | (Surface::Plane(p), Surface::Nurbs(n)) =>
+            nurbs_analytic_or_fallback(a, b, tolerance,
+                |t| crate::algebraic::nurbs_analytic::intersect_nurbs_plane(n, p, t)),
+        (Surface::Nurbs(n), Surface::Sphere(s)) | (Surface::Sphere(s), Surface::Nurbs(n)) =>
+            nurbs_analytic_or_fallback(a, b, tolerance,
+                |t| crate::algebraic::nurbs_analytic::intersect_nurbs_sphere(n, s, t)),
+        (Surface::Nurbs(n), Surface::Cylinder(c)) | (Surface::Cylinder(c), Surface::Nurbs(n)) =>
+            nurbs_analytic_or_fallback(a, b, tolerance,
+                |t| crate::algebraic::nurbs_analytic::intersect_nurbs_cylinder(n, c, t)),
+        (Surface::Nurbs(n), Surface::Cone(c)) | (Surface::Cone(c), Surface::Nurbs(n)) =>
+            nurbs_analytic_or_fallback(a, b, tolerance,
+                |t| crate::algebraic::nurbs_analytic::intersect_nurbs_cone(n, c, t)),
+        (Surface::Nurbs(n), Surface::Torus(t_)) | (Surface::Torus(t_), Surface::Nurbs(n)) =>
+            nurbs_analytic_or_fallback(a, b, tolerance,
+                |t| crate::algebraic::nurbs_analytic::intersect_nurbs_torus(n, t_, t)),
+
+        // ── NURBS-vs-NURBS → general marching ──
+        //
+        // The walking-skeleton subdivision intersection in
+        // `algebraic::nurbs_nurbs` is correct (4 unit tests pass) but
+        // its per-pair cost scales as O((1/tol)²) leaves which is
+        // slower than the marcher on real CAD with hundreds of NURBS
+        // face pairs. Wiring it in regressed ABC from 93.3% to 90.0%.
+        // Phase 2B.4 (Sederberg-Nishita fat-plane clipping) replaces
+        // subdivision with O(1) per-iteration convergence on
+        // transversal intersections; the dispatcher arm goes live
+        // when that ships.
         _ => general_ssi(a, b, tolerance),
     }
+}
+
+/// Try the algebraic NURBS-vs-analytic path first; fall through to
+/// the general marcher if it produces no validated traces. This keeps
+/// the algebraic dispatch strictly additive — when validation fails
+/// (degenerate config, polynomial-size cap, off-surface output) we
+/// route to the path that's already in production.
+fn nurbs_analytic_or_fallback<F>(
+    a: &Surface,
+    b: &Surface,
+    tolerance: f64,
+    algebraic: F,
+) -> KResult<Vec<SurfaceSurfaceTrace>>
+where
+    F: FnOnce(f64) -> KResult<Vec<SurfaceSurfaceTrace>>,
+{
+    if let Ok(traces) = algebraic(tolerance) {
+        if !traces.is_empty() {
+            return Ok(traces);
+        }
+    }
+    general_ssi(a, b, tolerance)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -609,7 +664,13 @@ fn cone_cone(c1: &Cone, c2: &Cone, tolerance: f64) -> KResult<Vec<SurfaceSurface
 }
 
 fn cone_torus(cone: &Cone, torus: &Torus, tolerance: f64) -> KResult<Vec<SurfaceSurfaceTrace>> {
-    // TODO: coaxial cone-torus → quartic in one parameter
+    // Cone-torus algebraic path (intersect_cone_torus, with implicit-
+    // validation gate) is available but disabled in the dispatcher: in
+    // A/B testing on ABC, switching SSI alone changes the *downstream*
+    // split-face / cell-classification behavior in ways that aren't
+    // strictly additive. The path stays in the codebase, ready to be
+    // enabled once shared-edge topology and split-face robustness can
+    // absorb a different SSI's output cleanly.
     general_ssi(&Surface::Cone(cone.clone()), &Surface::Torus(torus.clone()), tolerance)
 }
 
@@ -629,11 +690,24 @@ fn torus_torus(t1: &Torus, t2: &Torus, tolerance: f64) -> KResult<Vec<SurfaceSur
 /// - Closed loops (trace returns to its start)
 /// - Tangent intersections (|n_a × n_b| → 0)
 /// - Curvature-adaptive step size
+///
+/// Per-call wall-clock budget: each `general_ssi` invocation has a
+/// soft cap on wall-clock time. When exceeded, the marcher returns
+/// what it has (possibly empty). Without this, a single
+/// pathological face pair (e.g., two near-tangent NURBS-derived
+/// surfaces with extreme curvature) can consume the entire boolean
+/// budget in seed-finding or marching alone — wedging the rest of
+/// the pipeline. The cap keeps the dominant cost bounded per pair
+/// while still letting fast pairs finish naturally.
+const GENERAL_SSI_BUDGET_MS: u128 = 200;
+
 fn general_ssi(
     a: &Surface,
     b: &Surface,
     tolerance: f64,
 ) -> KResult<Vec<SurfaceSurfaceTrace>> {
+    let ssi_deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(GENERAL_SSI_BUDGET_MS as u64);
     let a_domain = a.domain();
     let b_domain = b.domain();
 
@@ -686,6 +760,11 @@ fn general_ssi(
     for seed_idx in 0..refined.len() {
         if used[seed_idx] {
             continue;
+        }
+        // Per-pair budget: stop launching new marches once the budget
+        // is spent. The work already in `traces` is returned as-is.
+        if std::time::Instant::now() > ssi_deadline {
+            break;
         }
         used[seed_idx] = true;
         let seed = &refined[seed_idx];

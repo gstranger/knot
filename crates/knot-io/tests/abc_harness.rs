@@ -17,6 +17,12 @@ use knot_ops::boolean::{boolean, BooleanOp};
 use knot_tessellate::{tessellate, TessellateOptions};
 
 /// Find STEP files in data/abc/ recursively.
+///
+/// Filesystem iteration order is platform-dependent, which would
+/// make the harness non-deterministic across runs (different model
+/// pairs sampled, different success counts). Sort by filename so a
+/// given corpus produces a fixed sequence and reliability numbers
+/// are comparable run-to-run.
 fn find_step_files(max_files: usize) -> Vec<PathBuf> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
@@ -27,7 +33,9 @@ fn find_step_files(max_files: usize) -> Vec<PathBuf> {
     }
 
     let mut files = Vec::new();
-    walk_dir(&base, max_files, &mut files);
+    walk_dir(&base, usize::MAX, &mut files);
+    files.sort();
+    files.truncate(max_files);
     files
 }
 
@@ -100,17 +108,35 @@ fn run_boolean_timed(
     op: BooleanOp,
     timeout: Duration,
 ) -> (&'static str, Duration) {
+    use std::sync::mpsc;
+
     let start = Instant::now();
+    // Watchdog timeout: spawn the boolean on a worker thread and
+    // wait on a channel. If the worker doesn't respond within
+    // `timeout`, we declare a timeout and proceed; the worker thread
+    // is orphaned (it will run to completion and drop its result, or
+    // be cleaned up at process exit). Without this watchdog a true
+    // infinite loop in the boolean wedges the whole harness — the
+    // post-hoc elapsed-time check below was never sufficient.
+    let (tx, rx) = mpsc::channel();
+    let a_clone = a.clone();
+    let b_clone = b.clone();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boolean(&a_clone, &b_clone, op)
+        }));
+        // It's fine if the receiver is gone — we've already moved on.
+        let _ = tx.send(result);
+    });
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        boolean(a, b, op)
-    }));
-
+    let result = match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(mpsc::RecvTimeoutError::Timeout) => return ("timeout", start.elapsed()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return ("crash", start.elapsed());
+        }
+    };
     let elapsed = start.elapsed();
-
-    if elapsed > timeout {
-        return ("timeout", elapsed);
-    }
 
     match result {
         Err(_) => ("crash", elapsed),
@@ -120,6 +146,8 @@ fn run_boolean_timed(
                 ("empty", elapsed)
             } else if msg.contains("input A has invalid") || msg.contains("input B has invalid") {
                 ("bad_input", elapsed)
+            } else if msg.contains("E404") || msg.contains("budget exceeded") {
+                ("timeout", elapsed)
             } else {
                 ("topo_fail", elapsed)
             }
@@ -235,10 +263,42 @@ fn abc_boolean_reliability() {
                 "valid" => report.valid += 1,
                 "empty" => report.empty += 1,
                 "bad_input" => report.bad_input += 1,
-                "topo_fail" => report.topo_fail += 1,
+                "topo_fail" => {
+                    report.topo_fail += 1;
+                    let op_name = match op {
+                        BooleanOp::Union => "U",
+                        BooleanOp::Intersection => "I",
+                        BooleanOp::Subtraction => "S",
+                    };
+                    // Recompute the error message for diagnostic.
+                    let detail = match boolean(&models[i].1, &models[j].1, op) {
+                        Err(e) => e.to_string(),
+                        _ => String::from("(no error on retry)"),
+                    };
+                    eprintln!(
+                        "  TOPO_FAIL [{:>4}ms] {} {} {} — {}",
+                        elapsed.as_millis(), op_name,
+                        models[i].0.chars().take(40).collect::<String>(),
+                        models[j].0.chars().take(40).collect::<String>(),
+                        detail.chars().take(180).collect::<String>(),
+                    );
+                }
                 "tess_fail" => report.tess_fail += 1,
                 "crash" => report.crash += 1,
-                "timeout" => report.timeout += 1,
+                "timeout" => {
+                    report.timeout += 1;
+                    let op_name = match op {
+                        BooleanOp::Union => "U",
+                        BooleanOp::Intersection => "I",
+                        BooleanOp::Subtraction => "S",
+                    };
+                    eprintln!(
+                        "  TIMEOUT [{:>4}ms] {} {} {}",
+                        elapsed.as_millis(), op_name,
+                        models[i].0.chars().take(40).collect::<String>(),
+                        models[j].0.chars().take(40).collect::<String>()
+                    );
+                }
                 _ => {}
             }
         }
