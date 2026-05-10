@@ -16,14 +16,35 @@ use super::parser::{StepFile, Entity, Param};
 
 /// Read a STEP file string and return a BRep.
 ///
-/// STEP files can contain multiple MANIFOLD_SOLID_BREP entities (an
-/// assembly, or a part with several disjoint solids). We currently
-/// pick the FIRST solid and only fall through to others if reading
-/// the first fails. This matches a common CAD convention where the
-/// primary body comes first in entity order, and tested measurably
-/// better on ABC than "pick largest" (large solids are more likely
-/// to have topology defects or be too dense for the current boolean
-/// pipeline). True multi-solid composition is future work.
+/// STEP files can contain multiple `MANIFOLD_SOLID_BREP` entities
+/// (an assembly, or a part with several disjoint solids). We pick
+/// the **first solid that imports successfully** and skip the rest.
+/// Earlier we tried merging all solids' shells into one combined
+/// shell, on the hypothesis that "off by 2·(N-1)" Euler violations
+/// were caused by partial loading. The audit showed this is
+/// **wrong** for ABC: most multi-solid files are assemblies whose
+/// components share walls, and merging shells creates coincident /
+/// adjacent face duplicates that produce thousands of spurious
+/// intersection curves downstream — wedging the boolean budget on
+/// pairs that previously fit comfortably (e.g., pair (24, 25)
+/// went from 1.4s SSI loop to producing 5818 traces from 410 pairs
+/// and busting the budget).
+///
+/// The right fix for assembly-style multi-solid files is not at
+/// the import layer — it's at the boolean dispatch layer, where
+/// each solid component should be treated as a separate operand
+/// (or coincident faces should be detected and shared during
+/// merge). Until that exists, single-solid loading is the right
+/// trade. The cost is that genuinely-disjoint multi-solid files
+/// load with N-1 components missing; for ABC chunk 0000 these
+/// produce `EulerViolation` rejections that are honest about the
+/// missing topology.
+///
+/// If the first solid fails to import, fall through to subsequent
+/// solids (some files have a small "Part 2" stub before the main
+/// body — try the next one). If the file has no
+/// `MANIFOLD_SOLID_BREP` at all, scan
+/// `ADVANCED_BREP_SHAPE_REPRESENTATION` items for nested solids.
 pub fn read_step(input: &str) -> KResult<BRep> {
     let step = super::parser::parse_step(input).map_err(|e| KernelError::Io {
         detail: format!("STEP parse error: {}", e),
@@ -63,9 +84,8 @@ pub fn read_step(input: &str) -> KResult<BRep> {
         });
     }
 
-    // Try entities in source order. Take the first that imports
-    // successfully. STEP exporters typically emit the "primary" body
-    // first, and on real CAD this beats heuristics like "pick largest".
+    // Try entities in source order; take the first that imports
+    // successfully.
     let mut last_err: Option<KernelError> = None;
     for entity in &solid_entities {
         match ctx.read_solid(entity) {
@@ -102,15 +122,24 @@ impl<'a> ReadContext<'a> {
         })
     }
 
-    fn read_solid(&self, entity: &Entity) -> KResult<BRep> {
-        // MANIFOLD_SOLID_BREP('name', #closed_shell)
+    /// Read a single MANIFOLD_SOLID_BREP and return its shell. Used
+    /// by `read_step` to load every solid in a multi-solid file.
+    fn read_solid_shell(&self, entity: &Entity) -> KResult<Shell> {
         let shell_id = entity.params.get(1)
             .and_then(|p| p.as_ref())
             .ok_or_else(|| KernelError::Io {
                 detail: format!("#{}: missing shell ref", entity.id),
             })?;
+        self.read_shell(shell_id)
+    }
 
-        let shell = self.read_shell(shell_id)?;
+    /// Backwards-compatible: read a single solid's BRep (one
+    /// MANIFOLD_SOLID_BREP only). Retained for callers that want a
+    /// single-solid result; the public `read_step` entry point uses
+    /// `read_solid_shell` and merges across all top-level solids.
+    #[allow(dead_code)]
+    fn read_solid(&self, entity: &Entity) -> KResult<BRep> {
+        let shell = self.read_solid_shell(entity)?;
         let solid = Solid::new(shell, vec![])?;
         BRep::new(vec![solid])
     }
