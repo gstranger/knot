@@ -92,3 +92,43 @@ jobs:
           name: knot-wasm-pkg
           path: pkg/
           retention-days: 7
+
+  js:
+    name: JS workspace (knot-cad tests)
+    runs-on: ubuntu-latest
+    needs: wasm-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Download WASM artifact
+        # Use the artifact from the wasm-build job rather than
+        # re-running wasm-pack — saves ~2 minutes and ensures both
+        # jobs see the same wasm output.
+        uses: actions/download-artifact@v4
+        with:
+          name: knot-wasm-pkg
+          path: pkg/
+
+      - name: Install JS dependencies
+        run: pnpm install
+
+      - name: Run knot-cad tests
+        # Pure-TS tests (math primitives + future graph runtime). Don't
+        # touch WASM — fast, run in Node.
+        run: pnpm --filter knot-cad test
+
+      - name: Build knot-cad JS package
+        # tsup build verifies that the public API surface compiles
+        # cleanly under the package's tsconfig.
+        run: pnpm --filter knot-cad build
