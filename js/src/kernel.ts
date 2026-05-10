@@ -7,6 +7,7 @@
 // the consumer calls createKnot() which does the async init.
 import type {
   JsBrep as RawBrep,
+  JsCurve as RawCurve,
   JsSurfaceMesh as RawMesh,
   InitInput as WasmInitInput,
 } from 'knot-wasm';
@@ -79,6 +80,95 @@ export interface EdgeRef {
   start: Vec3;
   /** End point of the edge. */
   end: Vec3;
+}
+
+/** Discriminator returned by `JsCurve.curve_type()`. */
+export type CurveType = 'line' | 'arc' | 'elliptical_arc' | 'nurbs';
+
+export interface ArcOptions {
+  /** Center of the arc. */
+  center: Vec3;
+  /** Plane normal. The arc lies in the plane through `center` with this normal. */
+  normal: Vec3;
+  /** Radius. */
+  radius: number;
+  /** Reference axis: defines the angle = 0 direction. Should lie in the arc plane. */
+  refAxis: Vec3;
+  /** Start angle in radians. Default 0. */
+  startAngle?: number;
+  /** End angle in radians. Default 2*PI. */
+  endAngle?: number;
+}
+
+export interface NurbsCurveOptions {
+  controlPoints: Vec3[];
+  /** Per-control-point weights. Length must match controlPoints. Default: all 1. */
+  weights?: number[];
+  /** Knot vector. Length = controlPoints.length + degree + 1. */
+  knots: number[];
+  degree: number;
+}
+
+// ── Curve wrapper ──────────────────────────────────────────────
+
+/** Ergonomic wrapper around the kernel's opaque Curve handle. */
+export class Curve {
+  /** @internal */ _raw: RawCurve;
+  /** @internal */ constructor(raw: RawCurve) { this._raw = raw; }
+
+  /** Discriminator: 'line' | 'arc' | 'elliptical_arc' | 'nurbs'. */
+  get type(): CurveType { return this._raw.curve_type() as CurveType; }
+
+  /** Parameter domain `[t_start, t_end]`. */
+  domain(): [number, number] {
+    const d = this._raw.domain();
+    return [d[0]!, d[1]!];
+  }
+
+  /** Point on the curve at parameter `t`. */
+  pointAt(t: number): Vec3 {
+    const p = this._raw.point_at(t);
+    return { x: p[0]!, y: p[1]!, z: p[2]! };
+  }
+
+  /** Unit tangent vector at `t`. */
+  tangentAt(t: number): Vec3 {
+    const v = this._raw.tangent_at(t);
+    return { x: v[0]!, y: v[1]!, z: v[2]! };
+  }
+
+  /** Sample `n` evenly-spaced parameters; returns the corresponding points. */
+  sample(n: number): Vec3[] {
+    const flat = this._raw.sample(n);
+    const out: Vec3[] = [];
+    for (let i = 0; i < flat.length; i += 3) out.push({ x: flat[i]!, y: flat[i + 1]!, z: flat[i + 2]! });
+    return out;
+  }
+
+  /** `n+1` parameter values dividing the domain into `n` equal-parameter segments. */
+  divide(n: number): number[] {
+    return Array.from(this._raw.divide(n));
+  }
+
+  /** Closest point on the curve to `q`. Returns parameter, point, and distance. */
+  closestPoint(q: Vec3): { param: number; point: Vec3; distance: number } {
+    const r = this._raw.closest_point(q.x, q.y, q.z);
+    return {
+      param: r[0]!,
+      point: { x: r[1]!, y: r[2]!, z: r[3]! },
+      distance: r[4]!,
+    };
+  }
+
+  /** Axis-aligned bounding box. */
+  boundingBox(): BoundingBox {
+    const b = this._raw.bounding_box();
+    return { min: { x: b[0]!, y: b[1]!, z: b[2]! }, max: { x: b[3]!, y: b[4]!, z: b[5]! } };
+  }
+
+  /** Release WASM memory. */
+  free(): void { this._raw.free(); }
+  [Symbol.dispose](): void { this.free(); }
 }
 
 // ── Brep wrapper ───────────────────────────────────────────────
@@ -274,6 +364,18 @@ export interface Knot {
   /** Boolean subtraction: a \ b. */
   subtraction(a: Brep, b: Brep): Brep;
 
+  /** Create a straight line segment from `a` to `b`. */
+  line(a: Vec3, b: Vec3): Curve;
+
+  /** Create a circular arc. */
+  arc(opts: ArcOptions): Curve;
+
+  /** Create a NURBS curve from control points, weights, knot vector, and degree. */
+  nurbsCurve(opts: NurbsCurveOptions): Curve;
+
+  /** Sweep a planar profile BRep along a curve rail to create a solid. */
+  sweep(profile: Brep, rail: Curve): Brep;
+
   /** Import a BRep from a STEP file string. */
   importSTEP(stepString: string): Brep;
 
@@ -334,6 +436,31 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
       union: (a, b) => new Brep(mod.boolean_union(a._raw, b._raw)),
       intersection: (a, b) => new Brep(mod.boolean_intersection(a._raw, b._raw)),
       subtraction: (a, b) => new Brep(mod.boolean_subtraction(a._raw, b._raw)),
+
+      line: (a, b) => new Curve(mod.create_line(a.x, a.y, a.z, b.x, b.y, b.z)),
+
+      arc: (opts) => {
+        const startAngle = opts.startAngle ?? 0;
+        const endAngle = opts.endAngle ?? Math.PI * 2;
+        return new Curve(mod.create_arc(
+          opts.center.x, opts.center.y, opts.center.z,
+          opts.normal.x, opts.normal.y, opts.normal.z,
+          opts.radius,
+          opts.refAxis.x, opts.refAxis.y, opts.refAxis.z,
+          startAngle, endAngle,
+        ));
+      },
+
+      nurbsCurve: ({ controlPoints, weights, knots, degree }) => {
+        const cp = new Float64Array(controlPoints.flatMap(p => [p.x, p.y, p.z]));
+        const w = new Float64Array(weights ?? controlPoints.map(() => 1));
+        if (w.length !== controlPoints.length) {
+          throw new Error('nurbsCurve: weights length must match controlPoints length');
+        }
+        return new Curve(mod.create_nurbs_curve(cp, w, new Float64Array(knots), degree));
+      },
+
+      sweep: (profile, rail) => new Brep(mod.sweep(profile._raw, rail._raw)),
 
       importSTEP: (s) => new Brep(mod.import_step(s)),
       exportSTEP: (brep) => mod.export_step(brep._raw),

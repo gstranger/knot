@@ -1,4 +1,4 @@
-export { createKnot, Brep } from './kernel';
+export { createKnot, Brep, Curve } from './kernel';
 export type {
   Knot,
   MeshData,
@@ -11,4 +11,7 @@ export type {
   EdgeRef,
   TessellateOptions,
   InitInput,
+  CurveType,
+  ArcOptions,
+  NurbsCurveOptions,
 } from './kernel';

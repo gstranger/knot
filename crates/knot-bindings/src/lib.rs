@@ -33,36 +33,96 @@ pub fn create_nurbs_curve(
     let curve = NurbsCurve::new(pts, weights.to_vec(), knots.to_vec(), degree)
         .map_err(|e| JsError::new(&e.to_string()))?;
 
-    Ok(JsCurve { inner: curve })
+    Ok(JsCurve { inner: knot_geom::curve::Curve::Nurbs(curve) })
 }
 
-/// Opaque handle to a NURBS curve.
+/// Create a line segment curve from two endpoints.
+#[wasm_bindgen]
+pub fn create_line(
+    x0: f64, y0: f64, z0: f64,
+    x1: f64, y1: f64, z1: f64,
+) -> JsCurve {
+    JsCurve {
+        inner: knot_geom::curve::Curve::Line(
+            knot_geom::curve::LineSeg::new(
+                Point3::new(x0, y0, z0),
+                Point3::new(x1, y1, z1),
+            )
+        ),
+    }
+}
+
+/// Create a circular arc curve.
+///
+/// - `cx,cy,cz`: centre
+/// - `nx,ny,nz`: arc plane normal
+/// - `radius`: arc radius
+/// - `rx,ry,rz`: reference direction (angle = 0)
+/// - `start_angle`, `end_angle`: in radians
+#[wasm_bindgen]
+pub fn create_arc(
+    cx: f64, cy: f64, cz: f64,
+    nx: f64, ny: f64, nz: f64,
+    radius: f64,
+    rx: f64, ry: f64, rz: f64,
+    start_angle: f64, end_angle: f64,
+) -> JsCurve {
+    JsCurve {
+        inner: knot_geom::curve::Curve::CircularArc(
+            knot_geom::curve::CircularArc {
+                center: Point3::new(cx, cy, cz),
+                normal: Vector3::new(nx, ny, nz).normalize(),
+                radius,
+                ref_direction: Vector3::new(rx, ry, rz).normalize(),
+                start_angle,
+                end_angle,
+            }
+        ),
+    }
+}
+
+/// Opaque handle to a curve (line, arc, or NURBS).
 #[wasm_bindgen]
 pub struct JsCurve {
-    inner: NurbsCurve,
+    pub(crate) inner: knot_geom::curve::Curve,
 }
 
 #[wasm_bindgen]
 impl JsCurve {
     /// Evaluate a point at parameter t. Returns [x, y, z].
     pub fn point_at(&self, t: f64) -> Vec<f64> {
-        let p = self.inner.point_at(t);
+        let p = self.inner.point_at(knot_geom::curve::CurveParam(t));
         vec![p.x, p.y, p.z]
     }
 
+    /// Tangent vector at parameter t. Returns [dx, dy, dz].
+    pub fn tangent_at(&self, t: f64) -> Vec<f64> {
+        let d = self.inner.derivatives_at(knot_geom::curve::CurveParam(t));
+        vec![d.d1.x, d.d1.y, d.d1.z]
+    }
+
     /// Sample the curve at n evenly-spaced parameters.
-    /// Returns flat array [x0,y0,z0, x1,y1,z1, ...] for efficient rendering.
+    /// Returns flat array [x0,y0,z0, x1,y1,z1, ...].
     pub fn sample(&self, n: u32) -> Vec<f64> {
         let domain = self.inner.domain();
         let mut out = Vec::with_capacity(n as usize * 3);
         for i in 0..n {
             let t = domain.start + (domain.end - domain.start) * (i as f64 / (n - 1).max(1) as f64);
-            let p = self.inner.point_at(t);
+            let p = self.inner.point_at(knot_geom::curve::CurveParam(t));
             out.push(p.x);
             out.push(p.y);
             out.push(p.z);
         }
         out
+    }
+
+    /// Divide the curve into `n` equal-parameter segments.
+    /// Returns `n + 1` parameter values.
+    pub fn divide(&self, n: u32) -> Vec<f64> {
+        let domain = self.inner.domain();
+        (0..=n)
+            .map(|i| domain.start + (domain.end - domain.start) * (i as f64 / n.max(1) as f64))
+            .collect()
     }
 
     /// Get the curve domain [start, end].
@@ -71,21 +131,58 @@ impl JsCurve {
         vec![d.start, d.end]
     }
 
-    /// Number of control points.
+    /// Closest point on the curve to query (qx, qy, qz).
+    /// Returns [param, px, py, pz, distance].
+    pub fn closest_point(&self, qx: f64, qy: f64, qz: f64) -> Vec<f64> {
+        let q = Point3::new(qx, qy, qz);
+        let cp = self.inner.closest_point(&q);
+        vec![cp.param.0, cp.point.x, cp.point.y, cp.point.z, cp.distance]
+    }
+
+    /// Bounding box. Returns [min_x, min_y, min_z, max_x, max_y, max_z].
+    pub fn bounding_box(&self) -> Vec<f64> {
+        let bb = self.inner.bounding_box();
+        vec![bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z]
+    }
+
+    /// Curve type as a string: "line", "arc", "elliptical_arc", or "nurbs".
+    pub fn curve_type(&self) -> String {
+        match &self.inner {
+            knot_geom::curve::Curve::Line(_) => "line".into(),
+            knot_geom::curve::Curve::CircularArc(_) => "arc".into(),
+            knot_geom::curve::Curve::EllipticalArc(_) => "elliptical_arc".into(),
+            knot_geom::curve::Curve::Nurbs(_) => "nurbs".into(),
+        }
+    }
+
+    // ── NURBS-specific methods ───────────────────────────────────────
+
+    /// Number of control points (NURBS only, returns 0 for other types).
     pub fn control_point_count(&self) -> u32 {
-        self.inner.control_points().len() as u32
+        match &self.inner {
+            knot_geom::curve::Curve::Nurbs(n) => n.control_points().len() as u32,
+            _ => 0,
+        }
     }
 
-    /// Get control points as flat array [x0,y0,z0, ...].
+    /// Get control points as flat array [x0,y0,z0, ...] (NURBS only).
     pub fn control_points(&self) -> Vec<f64> {
-        self.inner.control_points().iter()
-            .flat_map(|p| [p.x, p.y, p.z])
-            .collect()
+        match &self.inner {
+            knot_geom::curve::Curve::Nurbs(n) => {
+                n.control_points().iter().flat_map(|p| [p.x, p.y, p.z]).collect()
+            }
+            _ => vec![],
+        }
     }
 
-    /// Insert a knot at parameter t, returning a new curve.
-    pub fn insert_knot(&self, t: f64) -> JsCurve {
-        JsCurve { inner: self.inner.insert_knot(t) }
+    /// Insert a knot at parameter t, returning a new curve (NURBS only).
+    pub fn insert_knot(&self, t: f64) -> Result<JsCurve, JsError> {
+        match &self.inner {
+            knot_geom::curve::Curve::Nurbs(n) => {
+                Ok(JsCurve { inner: knot_geom::curve::Curve::Nurbs(n.insert_knot(t)) })
+            }
+            _ => Err(JsError::new("insert_knot is only available for NURBS curves")),
+        }
     }
 }
 
@@ -459,6 +556,18 @@ pub fn revolve_brep(
         Vector3::new(ax, ay, az),
         angle,
     ).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(JsBrep { inner: brep })
+}
+
+/// Sweep a profile BRep along a rail curve.
+///
+/// `profile` should be a planar face BRep (e.g. from `create_profile`).
+/// `rail` is any curve (line, arc, or NURBS).
+/// Returns a closed solid.  If the rail is closed, no cap faces are added.
+#[wasm_bindgen]
+pub fn sweep(profile: &JsBrep, rail: &JsCurve) -> Result<JsBrep, JsError> {
+    let brep = knot_ops::sweep_1rail(&profile.inner, &rail.inner)
+        .map_err(|e| JsError::new(&e.to_string()))?;
     Ok(JsBrep { inner: brep })
 }
 
