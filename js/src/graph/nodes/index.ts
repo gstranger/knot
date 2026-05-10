@@ -13,11 +13,13 @@ import {
   makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode,
 } from './curve';
 import { makeTriangleNode } from './profile';
+import { makeLoft2Node, makeLoft3Node } from './loft';
 
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { makeBoxNode, makeSphereNode, makeBooleanNode };
 export { makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode };
 export { makeTriangleNode };
+export { makeLoft2Node, makeLoft3Node };
 export type { ViewConstants } from './view';
 export type { BooleanOp } from './boolean';
 export { defineNode } from './define';
@@ -42,6 +44,8 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     makeArcNode(knot),
     makeSweepNode(knot),
     makeTriangleNode(knot),
+    makeLoft2Node(knot),
+    makeLoft3Node(knot),
   ];
   for (const d of defs) r.register(d);
   return r;

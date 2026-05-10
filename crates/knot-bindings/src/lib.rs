@@ -571,6 +571,30 @@ pub fn sweep(profile: &JsBrep, rail: &JsCurve) -> Result<JsBrep, JsError> {
     Ok(JsBrep { inner: brep })
 }
 
+/// Loft between two planar profile BReps.
+///
+/// Profiles must share outer-loop vertex count; vertex `i` of `a` is
+/// connected to vertex `i` of `b`. Returns a closed solid with two
+/// planar caps and one ruled strip of side faces.
+#[wasm_bindgen]
+pub fn loft2(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
+    let brep = knot_ops::loft(&[a.inner.clone(), b.inner.clone()])
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(JsBrep { inner: brep })
+}
+
+/// Loft through three planar profile BReps.
+///
+/// Same constraints as `loft2`. Useful for waist-shaped solids without
+/// needing list-typed graph ports. Once data trees land, this collapses
+/// into a single variadic `loft` taking a list of profiles.
+#[wasm_bindgen]
+pub fn loft3(a: &JsBrep, b: &JsBrep, c: &JsBrep) -> Result<JsBrep, JsError> {
+    let brep = knot_ops::loft(&[a.inner.clone(), b.inner.clone(), c.inner.clone()])
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(JsBrep { inner: brep })
+}
+
 fn newell_normal_js(pts: &[Point3]) -> Vector3 {
     let n = pts.len();
     let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);

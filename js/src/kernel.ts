@@ -376,6 +376,14 @@ export interface Knot {
   /** Sweep a planar profile BRep along a curve rail to create a solid. */
   sweep(profile: Brep, rail: Curve): Brep;
 
+  /**
+   * Loft between two or three planar profile BReps. All profiles must share
+   * outer-loop vertex count; vertex `i` of profile `k` is connected to
+   * vertex `i` of profile `k+1`. Throws for unsupported lengths until
+   * list-typed graph ports land.
+   */
+  loft(profiles: Brep[]): Brep;
+
   /** Import a BRep from a STEP file string. */
   importSTEP(stepString: string): Brep;
 
@@ -461,6 +469,16 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
       },
 
       sweep: (profile, rail) => new Brep(mod.sweep(profile._raw, rail._raw)),
+
+      loft: (profiles) => {
+        if (profiles.length === 2) {
+          return new Brep(mod.loft2(profiles[0]!._raw, profiles[1]!._raw));
+        }
+        if (profiles.length === 3) {
+          return new Brep(mod.loft3(profiles[0]!._raw, profiles[1]!._raw, profiles[2]!._raw));
+        }
+        throw new Error(`loft: only 2 or 3 profiles supported in this build, got ${profiles.length}`);
+      },
 
       importSTEP: (s) => new Brep(mod.import_step(s)),
       exportSTEP: (brep) => mod.export_step(brep._raw),
