@@ -207,7 +207,8 @@ impl JsSurface {
             }
         }
 
-        JsSurfaceMesh { positions, normals, indices }
+        let tri_count = indices.len() / 3;
+        JsSurfaceMesh { positions, normals, indices, face_ids: vec![0; tri_count] }
     }
 }
 
@@ -217,6 +218,7 @@ pub struct JsSurfaceMesh {
     positions: Vec<f64>,
     normals: Vec<f64>,
     indices: Vec<u32>,
+    face_ids: Vec<u32>,
 }
 
 #[wasm_bindgen]
@@ -234,6 +236,11 @@ impl JsSurfaceMesh {
     /// Triangle indices (groups of 3).
     pub fn indices(&self) -> Vec<u32> {
         self.indices.clone()
+    }
+
+    /// Per-triangle source face index (maps each triangle back to its BRep face).
+    pub fn face_ids(&self) -> Vec<u32> {
+        self.face_ids.clone()
     }
 
     pub fn vertex_count(&self) -> u32 {
@@ -262,15 +269,53 @@ impl JsBrep {
             .sum()
     }
 
-    /// Tessellate the BRep into a triangle mesh.
+    /// Tessellate the BRep into a triangle mesh using default options.
     pub fn tessellate(&self) -> Result<JsSurfaceMesh, JsError> {
-        let mesh = knot_tessellate::tessellate(&self.inner, knot_tessellate::TessellateOptions::default())
+        self.tessellate_with(0.1, f64::INFINITY)
+    }
+
+    /// Tessellate with custom quality parameters.
+    ///
+    /// - `normal_tolerance`: max normal deviation in radians (smaller = finer mesh).
+    /// - `max_edge_length`: max triangle edge length (smaller = finer mesh).
+    pub fn tessellate_with(&self, normal_tolerance: f64, max_edge_length: f64) -> Result<JsSurfaceMesh, JsError> {
+        let opts = knot_tessellate::TessellateOptions {
+            normal_tolerance,
+            max_edge_length,
+        };
+        let mesh = knot_tessellate::tessellate(&self.inner, opts)
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(JsSurfaceMesh {
             positions: mesh.positions_flat(),
             normals: mesh.normals_flat(),
+            face_ids: mesh.face_ids,
             indices: mesh.indices,
         })
+    }
+
+    /// Validate the BRep topology. Throws on error.
+    pub fn validate(&self) -> Result<(), JsError> {
+        self.inner.validate().map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Axis-aligned bounding box: returns [min_x, min_y, min_z, max_x, max_y, max_z].
+    pub fn bounding_box(&self) -> Result<Vec<f64>, JsError> {
+        let mut all_pts: Vec<knot_geom::Point3> = Vec::new();
+        for solid in self.inner.solids() {
+            for face in solid.outer_shell().faces() {
+                for he in face.outer_loop().half_edges() {
+                    all_pts.push(*he.start_vertex().point());
+                }
+            }
+        }
+        let bbox = knot_core::Aabb3::from_points(&all_pts)
+            .ok_or_else(|| JsError::new("empty BRep has no bounding box"))?;
+        Ok(vec![bbox.min.x, bbox.min.y, bbox.min.z, bbox.max.x, bbox.max.y, bbox.max.z])
+    }
+
+    /// Serialize to CBOR bytes for persistence.
+    pub fn to_cbor(&self) -> Result<Vec<u8>, JsError> {
+        knot_io::to_cbor(&self.inner).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Export the BRep as binary STL bytes.
@@ -468,6 +513,14 @@ fn parse_edge_pairs(flat: &[f64]) -> Result<Vec<(Point3, Point3)>, JsError> {
             Point3::new(c[3], c[4], c[5]),
         ))
         .collect())
+}
+
+/// Deserialize a BRep from CBOR bytes (produced by `JsBrep.to_cbor()`).
+#[wasm_bindgen]
+pub fn from_cbor(data: &[u8]) -> Result<JsBrep, JsError> {
+    let brep = knot_io::from_cbor(data)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(JsBrep { inner: brep })
 }
 
 /// Import a BRep from a STEP file string.

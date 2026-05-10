@@ -26,8 +26,22 @@ export interface MeshData {
   positions: Float32Array;
   normals: Float32Array;
   indices: Uint32Array;
+  /** Per-triangle source face index (maps each triangle back to its BRep face). */
+  faceIds: Uint32Array;
   vertexCount: number;
   triangleCount: number;
+}
+
+export interface TessellateOptions {
+  /** Max normal deviation in radians (smaller = finer mesh). Default: 0.1. */
+  normalTolerance?: number;
+  /** Max triangle edge length (smaller = finer mesh). Default: Infinity. */
+  maxEdgeLength?: number;
+}
+
+export interface BoundingBox {
+  min: Vec3;
+  max: Vec3;
 }
 
 export interface SphereOptions {
@@ -42,6 +56,29 @@ export interface CylinderOptions {
   radius: number;
   height: number;
   sides?: number;
+}
+
+export interface ExtrudeOptions {
+  /** Extrusion direction. Defaults to {x:0, y:0, z:1}. */
+  direction?: Vec3;
+  /** Extrusion distance along the direction vector. */
+  distance: number;
+}
+
+export interface RevolveOptions {
+  /** A point on the revolution axis. Defaults to origin. */
+  axisOrigin?: Vec3;
+  /** The axis direction. Defaults to Y axis. */
+  axisDirection?: Vec3;
+  /** Revolution angle in radians. Defaults to 2*PI (full revolution). */
+  angle?: number;
+}
+
+export interface EdgeRef {
+  /** Start point of the edge. */
+  start: Vec3;
+  /** End point of the edge. */
+  end: Vec3;
 }
 
 // ── Brep wrapper ───────────────────────────────────────────────
@@ -62,11 +99,32 @@ export class Brep {
   }
 
   /** Tessellate to a triangle mesh. */
-  tessellate(): MeshData {
-    const mesh = this._raw.tessellate();
+  tessellate(opts?: TessellateOptions): MeshData {
+    const mesh = opts
+      ? this._raw.tessellate_with(opts.normalTolerance ?? 0.1, opts.maxEdgeLength ?? Infinity)
+      : this._raw.tessellate();
     const data = extractMesh(mesh);
     mesh.free();
     return data;
+  }
+
+  /** Validate the BRep topology. Throws on error. */
+  validate(): void {
+    this._raw.validate();
+  }
+
+  /** Axis-aligned bounding box. */
+  boundingBox(): BoundingBox {
+    const b = this._raw.bounding_box();
+    return {
+      min: { x: b[0], y: b[1], z: b[2] },
+      max: { x: b[3], y: b[4], z: b[5] },
+    };
+  }
+
+  /** Serialize to CBOR bytes for persistence. Deserialize with `knot.fromCBOR()`. */
+  toCBOR(): Uint8Array {
+    return this._raw.to_cbor();
   }
 
   /** Export as binary STL. */
@@ -111,6 +169,48 @@ export class Brep {
     return new Brep(this._raw.scale(sx, _sy, _sz));
   }
 
+  /**
+   * Extrude this profile Brep along a direction to create a solid.
+   *
+   * The Brep should be a planar profile (e.g. from `knot.profile()`).
+   */
+  extrude(opts: ExtrudeOptions): Brep {
+    const d = opts.direction ?? { x: 0, y: 0, z: 1 };
+    return new Brep(_wasm!.extrude(this._raw, d.x, d.y, d.z, opts.distance));
+  }
+
+  /**
+   * Revolve this profile Brep around an axis to create a solid.
+   *
+   * The Brep should be a planar profile (e.g. from `knot.profile()`).
+   */
+  revolve(opts?: RevolveOptions): Brep {
+    const o = opts?.axisOrigin ?? { x: 0, y: 0, z: 0 };
+    const a = opts?.axisDirection ?? { x: 0, y: 1, z: 0 };
+    const angle = opts?.angle ?? Math.PI * 2;
+    return new Brep(_wasm!.revolve_brep(this._raw, o.x, o.y, o.z, a.x, a.y, a.z, angle));
+  }
+
+  /**
+   * Fillet (round) edges with a constant radius.
+   *
+   * Edges are identified by their start/end vertex coordinates.
+   * Both adjacent faces must be planar.
+   */
+  fillet(edges: EdgeRef[], radius: number): Brep {
+    return new Brep(_wasm!.fillet_edges(this._raw, flattenEdgeRefs(edges), radius));
+  }
+
+  /**
+   * Chamfer (bevel) edges with a constant distance.
+   *
+   * Edges are identified by their start/end vertex coordinates.
+   * Both adjacent faces must be planar.
+   */
+  chamfer(edges: EdgeRef[], distance: number): Brep {
+    return new Brep(_wasm!.chamfer_edges(this._raw, flattenEdgeRefs(edges), distance));
+  }
+
   /** Boolean union: this ∪ other. */
   union(other: Brep): Brep {
     return new Brep(_wasm!.boolean_union(this._raw, other._raw));
@@ -147,6 +247,15 @@ export interface Knot {
   /** Kernel version string. */
   version(): string;
 
+  /**
+   * Create a planar polygon profile from 2D or 3D points.
+   *
+   * The result is a single-face open BRep suitable for `.extrude()` and `.revolve()`.
+   *
+   * 2D points are placed in the z=0 plane. 3D points define their own plane.
+   */
+  profile(points: Vec3[] | [number, number][]): Brep;
+
   /** Create a box centered at the origin. */
   box(sx: number, sy: number, sz: number): Brep;
 
@@ -170,6 +279,9 @@ export interface Knot {
 
   /** Export a BRep as a STEP file string. */
   exportSTEP(brep: Brep): string;
+
+  /** Deserialize a BRep from CBOR bytes (produced by `brep.toCBOR()`). */
+  fromCBOR(data: Uint8Array): Brep;
 }
 
 /**
@@ -190,6 +302,19 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
 
     const knot: Knot = {
       version: () => mod.version(),
+
+      profile: (points) => {
+        const first = points[0];
+        if (Array.isArray(first)) {
+          // [number, number][] → 2D
+          const flat = new Float64Array((points as [number, number][]).flatMap(([x, y]) => [x, y]));
+          return new Brep(mod.create_profile(flat, 2));
+        } else {
+          // Vec3[]
+          const flat = new Float64Array((points as Vec3[]).flatMap((p) => [p.x, p.y, p.z]));
+          return new Brep(mod.create_profile(flat, 3));
+        }
+      },
 
       box: (sx, sy, sz) => new Brep(mod.create_box(sx, sy, sz)),
 
@@ -212,6 +337,7 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
 
       importSTEP: (s) => new Brep(mod.import_step(s)),
       exportSTEP: (brep) => mod.export_step(brep._raw),
+      fromCBOR: (data) => new Brep(mod.from_cbor(data)),
     };
 
     return knot;
@@ -222,16 +348,32 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
 
 // ── Helpers ────────────────────────────────────────────────────
 
+function flattenEdgeRefs(edges: EdgeRef[]): Float64Array {
+  const flat = new Float64Array(edges.length * 6);
+  for (let i = 0; i < edges.length; i++) {
+    const { start: s, end: e } = edges[i];
+    flat[i * 6]     = s.x;
+    flat[i * 6 + 1] = s.y;
+    flat[i * 6 + 2] = s.z;
+    flat[i * 6 + 3] = e.x;
+    flat[i * 6 + 4] = e.y;
+    flat[i * 6 + 5] = e.z;
+  }
+  return flat;
+}
+
 function extractMesh(mesh: RawMesh): MeshData {
   // Kernel gives Float64Array; Three.js / WebGL wants Float32Array
   const positions = new Float32Array(mesh.positions());
   const normals = new Float32Array(mesh.normals());
   const indices = mesh.indices();
+  const faceIds = mesh.face_ids();
 
   return {
     positions,
     normals,
     indices,
+    faceIds,
     vertexCount: mesh.vertex_count(),
     triangleCount: mesh.triangle_count(),
   };

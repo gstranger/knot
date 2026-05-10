@@ -25,18 +25,21 @@ import { createKnot } from 'knot-cad'
 
 const knot = await createKnot()
 
-const box = knot.box(2, 2, 2)
-const hole = knot.cylinder({ radius: 0.8, height: 3 }).translate(0, 0, 0)
-const result = box.subtract(hole)
+// Sketch → extrude → boolean → export
+const profile = knot.profile([[0,0], [2,0], [2,2], [0,2]])
+const block = profile.extrude({ distance: 1 })
+const hole = knot.cylinder({ radius: 0.4, height: 2 }).translate(1, 1, -0.5)
+const result = block.subtract(hole)
 
 // Export for 3D printing
 const stl = result.toSTL()
 downloadBlob(stl, 'part.stl')
 
 // Clean up WASM memory
-result.free()
-box.free()
+profile.free()
+block.free()
 hole.free()
+result.free()
 ```
 
 ## Architecture
@@ -75,14 +78,21 @@ const knot = await createKnot('/assets/knot_bg.wasm')
 Factory methods that create `Brep` solids:
 
 ```ts
+// Primitives
 knot.box(sx, sy, sz)                         // box centered at origin
 knot.sphere({ radius, center?, segments?, rings? })
 knot.cylinder({ radius, height, center?, sides? })
 
+// Sketch profiles (for extrude/revolve)
+knot.profile([[0,0], [1,0], [1,1], [0,1]])   // 2D polygon (z=0 plane)
+knot.profile([{x:0,y:0,z:0}, ...])           // 3D polygon
+
+// Booleans
 knot.union(a, b)                              // boolean union
 knot.intersection(a, b)                       // boolean intersection
 knot.subtraction(a, b)                        // boolean subtraction
 
+// STEP I/O
 knot.importSTEP(stepString)                   // parse a STEP file
 knot.exportSTEP(brep)                         // write a STEP file
 ```
@@ -95,6 +105,24 @@ Wraps an opaque kernel solid. All operations return new `Brep` instances (the ke
 // Transforms
 const moved = brep.translate(dx, dy, dz)
 const turned = brep.rotate({ x: 0, y: 0, z: 1 }, Math.PI / 4)
+const bigger = brep.scale(2)                  // uniform
+const stretched = brep.scale(1, 2, 1)         // non-uniform (planar/NURBS only)
+
+// Feature operations (on profile Breps)
+const solid = profile.extrude({ distance: 5 })
+const solid2 = profile.extrude({ direction: { x: 1, y: 0, z: 1 }, distance: 3 })
+const lathe = profile.revolve()               // full 360 around Y axis
+const lathe2 = profile.revolve({
+  axisOrigin: { x: 0, y: 0, z: 0 },
+  axisDirection: { x: 0, y: 1, z: 0 },
+  angle: Math.PI,                             // half revolution
+})
+
+// Fillet and chamfer (edges identified by endpoint coordinates)
+const rounded = brep.fillet([
+  { start: { x: -1, y: -1, z: 1 }, end: { x: 1, y: -1, z: 1 } },
+], 0.2)
+const beveled = brep.chamfer([...edges], 0.1)
 
 // Booleans (chainable)
 const result = a.subtract(b)
@@ -143,35 +171,41 @@ Positions and normals are `Float32Array` (converted from the kernel's f64) for d
 
 ## React Three Fiber
 
-### `useKnot(wasmPath?): Knot | null`
+### `useKnot(wasmPath?): UseKnotResult`
 
-Hook that loads the WASM kernel. Returns `null` while loading, then the `Knot` API.
+Hook that loads the WASM kernel. Returns `{ knot, loading, error }` so you can handle all three states.
 
 ```tsx
 function App() {
-  const knot = useKnot()
-  if (!knot) return <div>Loading...</div>
+  const { knot, loading, error } = useKnot()
+
+  if (error) return <div>Failed to load: {error.message}</div>
+  if (loading) return <div>Loading kernel...</div>
+
   // knot is ready
 }
 ```
 
-### `useBrep(factory, deps): Brep | null`
+Safe to call from multiple components — the WASM module loads once.
 
-Hook that creates a `Brep` from a factory function. Automatically frees the previous `Brep` when dependencies change and on unmount.
+### `useBrep(knot, factory, deps): Brep | null`
+
+Hook that creates a `Brep` from a factory function. The factory receives the kernel instance, so you don't need to close over it or add it to deps manually. Automatically frees the previous `Brep` when dependencies change and on unmount.
+
+Returns `null` while `knot` is null (still loading).
 
 ```tsx
 function Part({ offset }: { offset: number }) {
-  const knot = useKnot()
+  const { knot } = useKnot()
 
-  const brep = useBrep(() => {
-    if (!knot) return null
-    const a = knot.box(2, 2, 2)
-    const b = knot.cylinder({ radius: 0.8, height: 3 }).translate(offset, 0, 0)
+  const brep = useBrep(knot, (k) => {
+    const a = k.box(2, 2, 2)
+    const b = k.cylinder({ radius: 0.8, height: 3 }).translate(offset, 0, 0)
     const result = a.subtract(b)
     a.free()
     b.free()
     return result
-  }, [knot, offset])
+  }, [offset])
 
   return <KnotMesh brep={brep} />
 }
@@ -181,7 +215,7 @@ The factory re-runs whenever `deps` change (like `useMemo`). Intermediate Breps 
 
 ### `<KnotMesh brep={...} />`
 
-React Three Fiber component that renders a `Brep` as a `<mesh>` with `BufferGeometry`.
+React Three Fiber component that renders a `Brep` as a `<mesh>` with `BufferGeometry`. Properly disposes GPU resources (calls `geometry.dispose()`) when the brep changes or the component unmounts.
 
 ```tsx
 import { Canvas } from '@react-three/fiber'
@@ -189,12 +223,9 @@ import { OrbitControls } from '@react-three/drei'
 import { useKnot, useBrep, KnotMesh } from 'knot-cad/react'
 
 function Scene() {
-  const knot = useKnot()
+  const { knot } = useKnot()
 
-  const brep = useBrep(() => {
-    if (!knot) return null
-    return knot.box(2, 2, 2)
-  }, [knot])
+  const brep = useBrep(knot, (k) => k.box(2, 2, 2), [])
 
   return (
     <Canvas camera={{ position: [5, 5, 5] }}>
@@ -213,6 +244,7 @@ Props:
 |---|---|---|---|
 | `brep` | `Brep \| null` | required | The solid to render. Renders nothing if null. |
 | `color` | `ColorRepresentation` | `'#4488cc'` | Material color. |
+| `tessellateOptions` | `TessellateOptions` | default | Control mesh density. |
 | `...rest` | mesh props | | Forwarded to the underlying `<mesh>`. |
 
 ## Exporting files

@@ -2,6 +2,14 @@
 //!
 //! This is the facade crate that re-exports all sub-crates.
 
+/// Install a panic hook that prints Rust panic messages to the browser console.
+/// Called automatically by wasm-bindgen on module init.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
 pub use knot_core as core;
 pub use knot_geom as geom;
 pub use knot_topo as topo;

@@ -10,4 +10,5 @@ pub(crate) mod topo_builder;
 pub use boolean::BooleanOp;
 pub use extrude::{extrude_linear, revolve};
 pub use fillet::{fillet, chamfer};
+pub use sweep::sweep_1rail;
 pub use transform::{transform_brep, scale_brep};

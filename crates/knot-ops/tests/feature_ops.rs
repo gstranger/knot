@@ -255,3 +255,90 @@ fn revolve_two_adjacent_axis_vertices() {
     assert!(solid.outer_shell().is_closed());
     assert!(brep.validate().is_ok());
 }
+
+// ── inner loop (hole) tests ──────────────────────────────────────────────────
+
+/// Create a profile with an outer loop and one inner loop (hole).
+fn make_holed_profile(
+    outer: &[Point3],
+    inner: &[Point3],
+    normal: Vector3,
+) -> BRep {
+    let make_loop_edges = |pts: &[Point3]| -> Vec<HalfEdge> {
+        let n = pts.len();
+        let verts: Vec<Arc<Vertex>> = pts.iter().map(|p| Arc::new(Vertex::new(*p))).collect();
+        (0..n)
+            .map(|i| {
+                let j = (i + 1) % n;
+                let curve = Arc::new(Curve::Line(LineSeg::new(pts[i], pts[j])));
+                let edge =
+                    Arc::new(Edge::new(verts[i].clone(), verts[j].clone(), curve, 0.0, 1.0));
+                HalfEdge::new(edge, true)
+            })
+            .collect()
+    };
+
+    let outer_loop = Loop::new(make_loop_edges(outer), true).unwrap();
+    let inner_loop = Loop::new(make_loop_edges(inner), false).unwrap();
+    let surface = Arc::new(Surface::Plane(Plane::new(outer[0], normal)));
+    let face = Face::new(surface, outer_loop, vec![inner_loop], true).unwrap();
+    let shell = Shell::new(vec![face], false).unwrap();
+    let solid = Solid::new(shell, vec![]).unwrap();
+    BRep::new(vec![solid]).unwrap()
+}
+
+#[test]
+fn extrude_with_hole() {
+    // Square with a smaller square hole.
+    let profile = make_holed_profile(
+        &[
+            Point3::new(-2.0, -2.0, 0.0),
+            Point3::new(2.0, -2.0, 0.0),
+            Point3::new(2.0, 2.0, 0.0),
+            Point3::new(-2.0, 2.0, 0.0),
+        ],
+        &[
+            Point3::new(-0.5, -0.5, 0.0),
+            Point3::new(-0.5, 0.5, 0.0),
+            Point3::new(0.5, 0.5, 0.0),
+            Point3::new(0.5, -0.5, 0.0),
+        ],
+        Vector3::z(),
+    );
+
+    let brep = extrude_linear(&profile, Vector3::z(), 3.0).unwrap();
+    let solid = brep.single_solid().unwrap();
+    let shell = solid.outer_shell();
+
+    // 4 outer side quads + 4 inner side quads + 2 caps (with holes) = 10
+    assert_eq!(shell.face_count(), 10);
+    assert!(shell.is_closed());
+    assert!(brep.validate().is_ok());
+
+    // Tessellate — caps have holes, so the bridging + ear-clipping path is exercised.
+    let mesh =
+        knot_tessellate::tessellate(&brep, knot_tessellate::TessellateOptions::default()).unwrap();
+    assert!(mesh.triangle_count() > 0);
+}
+
+#[test]
+fn extrude_hole_deterministic() {
+    let profile = make_holed_profile(
+        &[
+            Point3::new(-1.0, -1.0, 0.0),
+            Point3::new(1.0, -1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(-1.0, 1.0, 0.0),
+        ],
+        &[
+            Point3::new(-0.3, -0.3, 0.0),
+            Point3::new(-0.3, 0.3, 0.0),
+            Point3::new(0.3, 0.3, 0.0),
+            Point3::new(0.3, -0.3, 0.0),
+        ],
+        Vector3::z(),
+    );
+    let a = extrude_linear(&profile, Vector3::z(), 1.0).unwrap();
+    let b = extrude_linear(&profile, Vector3::z(), 1.0).unwrap();
+    assert_eq!(a.id(), b.id());
+}

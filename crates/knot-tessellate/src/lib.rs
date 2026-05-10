@@ -64,13 +64,32 @@ pub fn tessellate(brep: &BRep, _options: TessellateOptions) -> KResult<TriMesh> 
     let mut face_idx = 0u32;
 
     for solid in brep.solids() {
-        tessellate_shell(solid.outer_shell(), &mut positions, &mut normals, &mut indices, &mut face_ids, &mut face_idx)?;
+        tessellate_shell(
+            solid.outer_shell(),
+            &mut positions,
+            &mut normals,
+            &mut indices,
+            &mut face_ids,
+            &mut face_idx,
+        )?;
         for void_shell in solid.void_shells() {
-            tessellate_shell(void_shell, &mut positions, &mut normals, &mut indices, &mut face_ids, &mut face_idx)?;
+            tessellate_shell(
+                void_shell,
+                &mut positions,
+                &mut normals,
+                &mut indices,
+                &mut face_ids,
+                &mut face_idx,
+            )?;
         }
     }
 
-    Ok(TriMesh { positions, normals, indices, face_ids })
+    Ok(TriMesh {
+        positions,
+        normals,
+        indices,
+        face_ids,
+    })
 }
 
 fn tessellate_shell(
@@ -103,25 +122,54 @@ fn tessellate_face(
         return Ok(());
     }
 
-    // Collect boundary vertices.
-    let verts: Vec<Point3> = half_edges.iter().map(|he| *he.start_vertex().point()).collect();
+    // Collect outer boundary vertices.
+    let outer_verts: Vec<Point3> =
+        half_edges.iter().map(|he| *he.start_vertex().point()).collect();
 
     // Compute face normal via Newell's method, respecting same_sense.
     let face_normal = {
-        let n = compute_polygon_normal(&verts);
+        let n = compute_polygon_normal(&outer_verts);
         if face.same_sense() { n } else { -n }
+    };
+
+    // Collect inner loop vertices (holes).
+    let inner_loops: Vec<Vec<Point3>> = face
+        .inner_loops()
+        .iter()
+        .filter(|il| il.half_edges().len() >= 3)
+        .map(|il| {
+            il.half_edges()
+                .iter()
+                .map(|he| *he.start_vertex().point())
+                .collect()
+        })
+        .collect();
+
+    // Merge inner loops into outer polygon via bridge edges.
+    let merged = if inner_loops.is_empty() {
+        outer_verts
+    } else {
+        bridge_inner_loops(&outer_verts, &inner_loops, &face_normal)
     };
 
     let base_idx = positions.len() as u32;
 
-    for v in &verts {
+    for v in &merged {
         positions.push(*v);
         normals.push(face_normal);
     }
 
-    // Ear-clipping triangulation (handles both convex and concave polygons).
-    let tris = ear_clip_triangulate(&verts, &face_normal);
+    // Ear-clipping triangulation.
+    let tris = ear_clip_triangulate(&merged, &face_normal);
     for [a, b, c] in tris {
+        // Skip degenerate triangles produced by bridge slit edges.
+        let pa = merged[a];
+        let pb = merged[b];
+        let pc = merged[c];
+        let area = (pb - pa).cross(&(pc - pa)).norm();
+        if area < 1e-20 {
+            continue;
+        }
         indices.push(base_idx + a as u32);
         indices.push(base_idx + b as u32);
         indices.push(base_idx + c as u32);
@@ -129,6 +177,86 @@ fn tessellate_face(
     }
 
     Ok(())
+}
+
+// ── inner loop bridging ──────────────────────────────────────────────────────
+
+/// Bridge inner loops (holes) into the outer polygon by inserting slit
+/// edges, producing a single simple polygon suitable for ear-clipping.
+///
+/// For each inner loop:
+/// 1. Find its rightmost vertex (max x in the 2D projection).
+/// 2. Find the nearest outer polygon vertex.
+/// 3. Insert the inner loop at that point, duplicating the bridge vertices
+///    to create a zero-width slit.
+fn bridge_inner_loops(
+    outer: &[Point3],
+    inner_loops: &[Vec<Point3>],
+    normal: &Vector3,
+) -> Vec<Point3> {
+    let proj = make_projection(normal);
+    let mut merged = outer.to_vec();
+
+    for inner in inner_loops {
+        if inner.len() < 3 {
+            continue;
+        }
+
+        // Find inner vertex with largest x in 2D projection.
+        let inner_2d: Vec<[f64; 2]> = inner.iter().map(|p| proj(p)).collect();
+        let rightmost_idx = inner_2d
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a[0].partial_cmp(&b[0]).unwrap())
+            .unwrap()
+            .0;
+
+        // Find nearest vertex on the current merged polygon.
+        let merged_2d: Vec<[f64; 2]> = merged.iter().map(|p| proj(p)).collect();
+        let target = inner_2d[rightmost_idx];
+        let bridge_idx = merged_2d
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a[0] - target[0]).powi(2) + (a[1] - target[1]).powi(2);
+                let db = (b[0] - target[0]).powi(2) + (b[1] - target[1]).powi(2);
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap()
+            .0;
+
+        // Build merged polygon:
+        //   ..., outer[bridge], inner[right], inner[right+1], ..., inner[right],
+        //   outer[bridge], outer[bridge+1], ...
+        let p = inner.len();
+        let mut new_merged = Vec::with_capacity(merged.len() + p + 2);
+        new_merged.extend_from_slice(&merged[..=bridge_idx]);
+        for k in 0..=p {
+            new_merged.push(inner[(rightmost_idx + k) % p]);
+        }
+        new_merged.push(merged[bridge_idx]);
+        if bridge_idx + 1 < merged.len() {
+            new_merged.extend_from_slice(&merged[bridge_idx + 1..]);
+        }
+
+        merged = new_merged;
+    }
+
+    merged
+}
+
+/// Build a 2D projection function for the given face normal.
+fn make_projection(normal: &Vector3) -> Box<dyn Fn(&Point3) -> [f64; 2]> {
+    let ax = normal.x.abs();
+    let ay = normal.y.abs();
+    let az = normal.z.abs();
+    if az >= ax && az >= ay {
+        Box::new(|p: &Point3| [p.x, p.y])
+    } else if ay >= ax {
+        Box::new(|p: &Point3| [p.x, p.z])
+    } else {
+        Box::new(|p: &Point3| [p.y, p.z])
+    }
 }
 
 // ── ear-clipping triangulation ───────────────────────────────────────────────
@@ -149,19 +277,7 @@ fn ear_clip_triangulate(verts: &[Point3], normal: &Vector3) -> Vec<[usize; 3]> {
         return vec![[0, 1, 2]];
     }
 
-    // Choose the two axes that best represent the polygon in 2D by
-    // dropping the coordinate most aligned with the normal.
-    let ax = normal.x.abs();
-    let ay = normal.y.abs();
-    let az = normal.z.abs();
-    let proj: Box<dyn Fn(&Point3) -> [f64; 2]> = if az >= ax && az >= ay {
-        Box::new(|p: &Point3| [p.x, p.y])
-    } else if ay >= ax {
-        Box::new(|p: &Point3| [p.x, p.z])
-    } else {
-        Box::new(|p: &Point3| [p.y, p.z])
-    };
-
+    let proj = make_projection(normal);
     let pts: Vec<[f64; 2]> = verts.iter().map(|v| proj(v)).collect();
 
     // Determine winding of the projected polygon.

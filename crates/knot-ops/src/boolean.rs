@@ -74,38 +74,49 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
         }
     }
 
-    // Wall-clock deadline for the whole boolean. Models with hundreds
-    // of unique surfaces (sculpted parts, dense NURBS) overrun the
-    // current SSI + split-face + classify pipeline regardless of how
-    // tightly we tune any one stage. Bail with a structured error
-    // rather than wedging the caller. Tuned to fit comfortably under
-    // the harness's 10s wall-clock watchdog.
-    let op_start = std::time::Instant::now();
-    let op_deadline = op_start + std::time::Duration::from_secs(8);
-    let trace_enabled = std::env::var_os("KNOT_BOOLEAN_TRACE").is_some();
-    let check_deadline = |stage: &str| -> KResult<()> {
-        if std::time::Instant::now() > op_deadline {
-            Err(KernelError::OperationFailed {
+    // Wall-clock deadline and tracing. On WASM, std::time::Instant panics,
+    // so these are compiled out entirely.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _op_start = std::time::Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _op_deadline = _op_start + std::time::Duration::from_secs(8);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _trace_enabled = std::env::var_os("KNOT_BOOLEAN_TRACE").is_some();
+    #[cfg(target_arch = "wasm32")]
+    let _trace_enabled = false;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn _now() -> std::time::Instant { std::time::Instant::now() }
+    #[cfg(target_arch = "wasm32")]
+    fn _now() {}
+
+    let check_deadline = |_stage: &str| -> KResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::time::Instant::now() > _op_deadline {
+            return Err(KernelError::OperationFailed {
                 code: ErrorCode::OperationTimeout,
-                detail: format!("boolean budget exceeded at stage {}", stage),
-            })
-        } else {
-            Ok(())
+                detail: format!("boolean budget exceeded at stage {}", _stage),
+            });
         }
+        Ok(())
     };
-    let trace_stage = |name: &str, t0: std::time::Instant| {
-        if trace_enabled {
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let _trace_stage = |name: &str, t0: std::time::Instant| {
+        if _trace_enabled {
             eprintln!(
                 "  [boolean trace] {:<22} {:>8}ms  (cumulative {:>5}ms)",
                 name,
                 t0.elapsed().as_millis(),
-                op_start.elapsed().as_millis(),
+                _op_start.elapsed().as_millis(),
             );
         }
     };
+    #[cfg(target_arch = "wasm32")]
+    let _trace_stage = |_name: &str, _t0: ()| {};
 
     // Step 1: Compute model-level snap grid from combined bounding box
-    let stage_start = std::time::Instant::now();
+    let _stage_start = _now();
     let bbox = compute_brep_bbox(solid_a, solid_b);
     let grid = SnapGrid::from_bbox_diagonal(bbox.diagonal_length(), 1e-9);
     let tolerance = grid.cell_size * 100.0; // geometric tolerance tied to grid
@@ -113,12 +124,12 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
 
     let faces_a: Vec<&Face> = solid_a.outer_shell().faces().iter().collect();
     let faces_b: Vec<&Face> = solid_b.outer_shell().faces().iter().collect();
-    trace_stage("setup", stage_start);
+    _trace_stage("setup", _stage_start);
 
     // Step 2: Face-face overlap filtering via bounding boxes
-    let stage_start = std::time::Instant::now();
+    let _stage_start = _now();
     let candidate_pairs = find_candidate_pairs(&faces_a, &faces_b, tolerance);
-    if trace_enabled {
+    if _trace_enabled {
         eprintln!(
             "  [boolean trace] candidates: {} of {} raw ({:.1}%)",
             candidate_pairs.len(),
@@ -126,7 +137,7 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
             100.0 * candidate_pairs.len() as f64 / (faces_a.len() * faces_b.len()) as f64,
         );
     }
-    trace_stage("candidate_filter", stage_start);
+    _trace_stage("candidate_filter", _stage_start);
 
     // Step 3: Compute SSI between candidate face pairs.
     // Clip cylinder/cone v-domains to face vertex extents so the SSI
@@ -151,7 +162,7 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
     // can take seconds, so parallelism just delays the deadline
     // detection. For models that aren't SSI-bound the sequential
     // loop is already fast.
-    let stage_start = std::time::Instant::now();
+    let _stage_start = _now();
     let mut intersections: Vec<FaceIntersection> = Vec::new();
     for &(ia, ib) in &candidate_pairs {
         check_deadline("SSI")?;
@@ -168,36 +179,36 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
             }
         }
     }
-    if trace_enabled {
+    if _trace_enabled {
         eprintln!(
             "  [boolean trace] SSI traces found: {} from {} candidate pairs",
             intersections.len(), candidate_pairs.len(),
         );
     }
-    trace_stage("ssi_loop", stage_start);
+    _trace_stage("ssi_loop", _stage_start);
 
     check_deadline("post-SSI")?;
 
     // Step 4-5: Split faces along intersection curves.
     // Both sides share a single TopologyBuilder so intersection edges are
     // allocated once and referenced with opposite half-edge orientations.
-    let stage_start = std::time::Instant::now();
+    let _stage_start = _now();
     let split_a = split_faces(&faces_a, &intersections, true, tolerance, &mut builder);
     let split_b = split_faces(&faces_b, &intersections, false, tolerance, &mut builder);
-    if trace_enabled {
+    if _trace_enabled {
         eprintln!(
             "  [boolean trace] split: A {} → {} sub-faces, B {} → {} sub-faces",
             faces_a.len(), split_a.len(), faces_b.len(), split_b.len(),
         );
     }
-    trace_stage("split_faces", stage_start);
+    _trace_stage("split_faces", _stage_start);
 
     check_deadline("post-split")?;
 
     // Step 6: Classify each sub-face using exact predicates where possible.
     // Pre-build per-solid classifiers so the per-face triangulation
     // and BVH construction is amortized over the full sub-face batch.
-    let stage_start = std::time::Instant::now();
+    let _stage_start = _now();
     let classifier_b = SolidClassifier::new(solid_b);
     let classifier_a = SolidClassifier::new(solid_a);
     let classified_a: Vec<(Face, Classification)> = split_a
@@ -215,7 +226,7 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
             (f, cls)
         })
         .collect();
-    trace_stage("classify", stage_start);
+    _trace_stage("classify", _stage_start);
 
     check_deadline("post-classify")?;
 

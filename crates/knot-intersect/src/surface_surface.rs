@@ -706,6 +706,7 @@ fn general_ssi(
     b: &Surface,
     tolerance: f64,
 ) -> KResult<Vec<SurfaceSurfaceTrace>> {
+    #[cfg(not(target_arch = "wasm32"))]
     let ssi_deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(GENERAL_SSI_BUDGET_MS as u64);
     let a_domain = a.domain();
@@ -763,6 +764,7 @@ fn general_ssi(
         }
         // Per-pair budget: stop launching new marches once the budget
         // is spent. The work already in `traces` is returned as-is.
+        #[cfg(not(target_arch = "wasm32"))]
         if std::time::Instant::now() > ssi_deadline {
             break;
         }

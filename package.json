@@ -3,6 +3,7 @@
   "scripts": {
     "build:wasm": "wasm-pack build --target web --out-dir pkg && node scripts/fix-pkg-name.mjs",
     "build:js": "pnpm --filter knot-cad build",
-    "build": "pnpm run build:wasm && pnpm run build:js"
+    "build": "pnpm run build:wasm && pnpm run build:js",
+    "demo": "pnpm run build && pnpm --filter knot-react-demo dev"
   }
 }

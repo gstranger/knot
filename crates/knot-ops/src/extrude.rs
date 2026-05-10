@@ -14,8 +14,8 @@ use crate::topo_builder::line_he;
 /// Extrude a BRep profile along a direction vector.
 ///
 /// The first face of the profile is swept by `direction * distance` to produce
-/// a closed prismatic solid.  Only the outer loop is used (inner loops / holes
-/// are ignored in this version).
+/// a closed prismatic solid.  Inner loops (holes) in the profile produce
+/// tunnels through the extruded solid.
 pub fn extrude_linear(profile: &BRep, direction: Vector3, distance: f64) -> KResult<BRep> {
     if direction.norm() < 1e-15 || distance.abs() < 1e-15 {
         return Err(KernelError::InvalidInput {
@@ -49,13 +49,38 @@ pub fn extrude_linear(profile: &BRep, direction: Vector3, distance: f64) -> KRes
         pts.reverse();
     }
 
+    // Collect inner loops from the profile face.
+    let reversed_outer = ln.dot(&dir) < 0.0;
+    let inner_loops: Vec<Vec<Point3>> = face
+        .inner_loops()
+        .iter()
+        .filter(|il| il.half_edges().len() >= 3)
+        .map(|il| {
+            let mut ip: Vec<Point3> =
+                il.half_edges().iter().map(|he| *he.start_vertex().point()).collect();
+            if reversed_outer {
+                ip.reverse();
+            }
+            ip
+        })
+        .collect();
+
     let bot: Vec<Arc<Vertex>> = pts.iter().map(|p| Arc::new(Vertex::new(*p))).collect();
     let top: Vec<Arc<Vertex>> =
         pts.iter().map(|p| Arc::new(Vertex::new(*p + offset))).collect();
 
-    let mut faces = Vec::with_capacity(nv + 2);
+    let inner_bot: Vec<Vec<Arc<Vertex>>> = inner_loops
+        .iter()
+        .map(|il| il.iter().map(|p| Arc::new(Vertex::new(*p))).collect())
+        .collect();
+    let inner_top: Vec<Vec<Arc<Vertex>>> = inner_loops
+        .iter()
+        .map(|il| il.iter().map(|p| Arc::new(Vertex::new(*p + offset))).collect())
+        .collect();
 
-    // Side quads
+    let mut faces = Vec::new();
+
+    // Outer side quads.
     for i in 0..nv {
         let j = (i + 1) % nv;
         let edge_dir = *bot[j].point() - *bot[i].point();
@@ -71,24 +96,66 @@ pub fn extrude_linear(profile: &BRep, direction: Vector3, distance: f64) -> KRes
         faces.push(Face::new(surf, lp, vec![], true)?);
     }
 
-    // Bottom cap (reversed winding → normal opposes extrusion)
-    let bot_edges: Vec<HalfEdge> = (0..nv)
+    // Inner side quads (tunnel walls).
+    for (ib, it) in inner_bot.iter().zip(inner_top.iter()) {
+        let m = ib.len();
+        for i in 0..m {
+            let j = (i + 1) % m;
+            let edge_dir = *ib[j].point() - *ib[i].point();
+            let normal = safe_normalize(edge_dir.cross(&offset));
+            let edges = vec![
+                line_he(&ib[i], &ib[j]),
+                line_he(&ib[j], &it[j]),
+                line_he(&it[j], &it[i]),
+                line_he(&it[i], &ib[i]),
+            ];
+            let lp = Loop::new(edges, true)?;
+            let surf = Arc::new(Surface::Plane(Plane::new(*ib[i].point(), normal)));
+            faces.push(Face::new(surf, lp, vec![], true)?);
+        }
+    }
+
+    // Bottom cap (reversed outer + reversed inner loops).
+    let bot_outer_edges: Vec<HalfEdge> = (0..nv)
         .rev()
         .map(|i| {
             let j = if i == 0 { nv - 1 } else { i - 1 };
             line_he(&bot[i], &bot[j])
         })
         .collect();
-    let bot_loop = Loop::new(bot_edges, true)?;
+    let bot_outer_loop = Loop::new(bot_outer_edges, true)?;
+    let bot_inner_loops: Vec<Loop> = inner_bot
+        .iter()
+        .map(|ib| {
+            let m = ib.len();
+            let edges: Vec<HalfEdge> = (0..m)
+                .rev()
+                .map(|i| {
+                    let j = if i == 0 { m - 1 } else { i - 1 };
+                    line_he(&ib[i], &ib[j])
+                })
+                .collect();
+            Loop::new(edges, false)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let bot_surf = Arc::new(Surface::Plane(Plane::new(*bot[0].point(), -dir)));
-    faces.push(Face::new(bot_surf, bot_loop, vec![], true)?);
+    faces.push(Face::new(bot_surf, bot_outer_loop, bot_inner_loops, true)?);
 
-    // Top cap (same winding → normal along extrusion)
-    let top_edges: Vec<HalfEdge> =
+    // Top cap (forward outer + forward inner loops).
+    let top_outer_edges: Vec<HalfEdge> =
         (0..nv).map(|i| line_he(&top[i], &top[(i + 1) % nv])).collect();
-    let top_loop = Loop::new(top_edges, true)?;
+    let top_outer_loop = Loop::new(top_outer_edges, true)?;
+    let top_inner_loops: Vec<Loop> = inner_top
+        .iter()
+        .map(|it| {
+            let m = it.len();
+            let edges: Vec<HalfEdge> =
+                (0..m).map(|i| line_he(&it[i], &it[(i + 1) % m])).collect();
+            Loop::new(edges, false)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let top_surf = Arc::new(Surface::Plane(Plane::new(*top[0].point(), dir)));
-    faces.push(Face::new(top_surf, top_loop, vec![], true)?);
+    faces.push(Face::new(top_surf, top_outer_loop, top_inner_loops, true)?);
 
     let shell = Shell::new(faces, true)?;
     let solid = Solid::new(shell, vec![])?;
@@ -293,7 +360,7 @@ pub fn revolve(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn first_face(brep: &BRep) -> KResult<&Face> {
+pub(crate) fn first_face(brep: &BRep) -> KResult<&Face> {
     for solid in brep.solids() {
         let faces = solid.outer_shell().faces();
         if !faces.is_empty() {
@@ -306,11 +373,11 @@ fn first_face(brep: &BRep) -> KResult<&Face> {
     })
 }
 
-fn loop_points(lp: &Loop) -> Vec<Point3> {
+pub(crate) fn loop_points(lp: &Loop) -> Vec<Point3> {
     lp.half_edges().iter().map(|he| *he.start_vertex().point()).collect()
 }
 
-fn newell_normal(pts: &[Point3]) -> Vector3 {
+pub(crate) fn newell_normal(pts: &[Point3]) -> Vector3 {
     let n = pts.len();
     let (mut nx, mut ny, mut nz) = (0.0, 0.0, 0.0);
     for i in 0..n {
@@ -323,7 +390,7 @@ fn newell_normal(pts: &[Point3]) -> Vector3 {
     Vector3::new(nx, ny, nz)
 }
 
-fn safe_normalize(v: Vector3) -> Vector3 {
+pub(crate) fn safe_normalize(v: Vector3) -> Vector3 {
     let len = v.norm();
     if len > 1e-30 { v / len } else { Vector3::z() }
 }
@@ -384,7 +451,7 @@ fn make_tri_face(
 }
 
 /// Build a quad face with outward-normal orientation check.
-fn make_quad_face(
+pub(crate) fn make_quad_face(
     a0: &Arc<Vertex>,
     a1: &Arc<Vertex>,
     b1: &Arc<Vertex>,
