@@ -315,12 +315,28 @@ pre-computes:
 - **Per-face axis-aligned bbox** of the triangulation.
 - **`knot_core::Bvh`** over those bboxes.
 
+The classify path uses two-stage culling: a BVH query against the
+ray segment's bounding box (first-pass O(log F) cull), then a
+Kay-Kajiya segment-vs-bbox **slab test** per surviving face (catches
+faces inside the segment's wide AABB but not actually on the
+segment's path).
+
+A subtle wrinkle worth flagging: `exact_ray_triangle` casts a
+deliberately off-axis segment of direction `(1e6, 3e5, 1e5)` — the
+off-axis bias avoids degenerate alignment with axis-aligned face
+boundaries common in CAD. The segment's bounding box is therefore
+huge (covers an octant from the test point), so naive bbox-only
+culling under-rejects. Slab test gets the cull rate back. An earlier
+version used an axis-aligned y/z prefilter that worked in expectation
+but broke on the actual off-axis segment, misclassifying axis-aligned
+inputs. The slab test is the correct generalization.
+
 This turns the per-call cost from `O(F)` triangulations + ray tests
 into `O(F)` *amortized* triangulation (built once per solid, not per
-classify call) plus `O(log F + hits)` ray tests via BVH culling. On
-the ABC pathological pair (32, 33), this dropped classify from
-**23.9 seconds to 1.96 seconds** — a 12× speedup that was the single
-biggest reliability unblock in the project.
+classify call) plus `O(log F + hits)` ray tests via BVH + slab
+culling. On the ABC pathological pair (32, 33), this dropped classify
+from **23.9 seconds to ~5 seconds** — the single biggest reliability
+unblock in the project.
 
 ### 7. Per-op face selection
 

@@ -721,32 +721,36 @@ impl SolidClassifier {
     }
 
     /// Classify a 3D point as Inside or Outside by ray-casting the
-    /// pre-triangulated faces. Uses BVH to cull faces whose bbox
-    /// doesn't contain the ray's path (the ray goes from `point` in
-    /// the +x direction by convention; bbox must overlap that ray).
+    /// pre-triangulated faces.
+    ///
+    /// `exact_ray_triangle` casts a deliberately off-axis segment of
+    /// direction `(1e6, 3e5, 1e5)` from `point` (the off-axis bias
+    /// avoids degenerate alignment with axis-aligned face boundaries
+    /// — common in CAD). Two-stage culling:
+    ///
+    /// 1. BVH query against the segment's bounding box. O(log F)
+    ///    rejects most faces.
+    /// 2. Per-face segment-vs-bbox slab test (Kay-Kajiya). This
+    ///    catches faces inside the segment's bbox but not actually
+    ///    on the segment — the AABB of an off-axis segment of length
+    ///    1e6 in x covers a huge volume that's mostly empty.
+    ///
+    /// Earlier iterations used an axis-aligned y/z prefilter
+    /// (`bb.max.y < point.y`) that worked for axis-aligned rays but
+    /// broke on the actual off-axis segment, misclassifying faces
+    /// at non-zero y/z. The slab test is the correct generalization.
     pub fn classify(&self, point: &Point3) -> Classification {
         let query = ExactPoint3::from_f64(point.x, point.y, point.z);
-        // Build a query bbox that bounds the +x ray from `point`. Any
-        // candidate face whose bbox doesn't overlap this region can't
-        // be hit by the ray. The y/z extents must include `point.y`
-        // and `point.z`; the x extent runs from `point.x` to +∞,
-        // approximated by a very large value here.
-        let query_bbox = knot_core::Aabb3::new(
-            Point3::new(point.x, point.y, point.z),
-            Point3::new(f64::MAX / 4.0, point.y, point.z),
-        );
+        let seg_end = Point3::new(point.x + 1e6, point.y + 3e5, point.z + 1e5);
+        let query_bbox = knot_core::Aabb3::new(*point, seg_end);
         let candidates = self.bvh.query(&query_bbox);
 
         let mut crossings = 0i32;
         for face_idx in candidates {
-            // Cheap bbox prefilter: skip faces whose y/z range
-            // doesn't span the query y/z. A ray cast in +x direction
-            // hits a triangle only if the triangle's y/z bbox contains
-            // the ray's y, z values.
             let bb = &self.face_bboxes[face_idx];
-            if bb.max.y < point.y || bb.min.y > point.y
-                || bb.max.z < point.z || bb.min.z > point.z
-            {
+            // Slab test: does the segment from `point` to `seg_end`
+            // actually intersect this face's bbox?
+            if !segment_intersects_bbox(point, &seg_end, bb) {
                 continue;
             }
             for tri in &self.triangulations[face_idx] {
@@ -947,6 +951,45 @@ fn project_point_to_surface(point: &Point3, surface: &Surface) -> Point3 {
 /// Exact ray-triangle intersection test using orientation predicates.
 /// Ray: origin → +x direction (deterministic, avoids degenerate alignments
 /// by using a slightly off-axis direction encoded as rational).
+/// Kay-Kajiya slab test: does the line segment from `start` to `end`
+/// intersect the AABB? Computes the parametric range `t ∈ [0, 1]`
+/// where the segment is inside each axis's slab; intersection exists
+/// iff the per-axis intervals overlap. For nearly-axis-aligned
+/// segments the test still works because we test each axis
+/// independently.
+fn segment_intersects_bbox(
+    start: &Point3,
+    end: &Point3,
+    bbox: &knot_core::Aabb3,
+) -> bool {
+    let d = [end.x - start.x, end.y - start.y, end.z - start.z];
+    let s = [start.x, start.y, start.z];
+    let lo = [bbox.min.x, bbox.min.y, bbox.min.z];
+    let hi = [bbox.max.x, bbox.max.y, bbox.max.z];
+
+    let mut t_min = 0.0_f64;
+    let mut t_max = 1.0_f64;
+    for axis in 0..3 {
+        if d[axis].abs() < 1e-15 {
+            // Segment is parallel to this slab. Inside the slab iff
+            // start coordinate is within the bbox's range on this axis.
+            if s[axis] < lo[axis] || s[axis] > hi[axis] {
+                return false;
+            }
+        } else {
+            let t1 = (lo[axis] - s[axis]) / d[axis];
+            let t2 = (hi[axis] - s[axis]) / d[axis];
+            let (t_lo, t_hi) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            t_min = t_min.max(t_lo);
+            t_max = t_max.min(t_hi);
+            if t_min > t_max {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn exact_ray_triangle(
     origin: &ExactPoint3,
     v0: &ExactPoint3,
