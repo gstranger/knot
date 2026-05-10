@@ -1,0 +1,109 @@
+name: Deploy demo to GitHub Pages
+
+# Builds the React demo (examples/react-demo/) with the WASM kernel
+# and publishes it to GitHub Pages on every push to main.
+#
+# To enable: in the repo's Settings → Pages, set "Source" to
+# "GitHub Actions". The first successful run of this workflow will
+# create the deployment; the URL appears in the workflow summary
+# (typically https://<user>.github.io/knot/).
+#
+# The Vite config reads the BASE_URL env var so the asset paths
+# match GitHub Pages' subpath layout (e.g. `/knot/`). For local
+# `pnpm dev` the env var is unset and assets use the root path.
+
+on:
+  push:
+    branches: [main]
+  # Allow manual re-runs from the Actions tab.
+  workflow_dispatch:
+
+# Pages deploys are serialized — concurrent deployments produce
+# undefined behavior. `cancel-in-progress: false` queues new pushes
+# rather than dropping them mid-deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # checkout the repo
+  pages: write     # publish to Pages
+  id-token: write  # OIDC for Pages deployment
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.83.0"
+
+jobs:
+  build:
+    name: Build demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-wasm
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.13.1"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Build WASM
+        run: |
+          wasm-pack build --target web --out-dir pkg
+          node scripts/fix-pkg-name.mjs
+
+      - name: Install JS dependencies
+        # --frozen-lockfile would be nicer but the demo's lockfile is
+        # in the repo root and is large; install in standard mode and
+        # let the cache help.
+        run: pnpm install
+
+      - name: Build knot-cad JS package
+        run: pnpm --filter knot-cad build
+
+      - name: Build React demo
+        # BASE_URL is read by examples/react-demo/vite.config.ts so
+        # asset paths resolve under the GitHub Pages subpath.
+        env:
+          BASE_URL: /${{ github.event.repository.name }}/
+        run: pnpm --filter knot-react-demo build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: examples/react-demo/dist
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      # The Pages deployment URL is set by the deploy step and shown
+      # in the workflow summary.
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -256,6 +256,40 @@ python3 -m http.server 8080
 # open http://localhost:8080/web/
 ```
 
+A richer React + react-three-fiber demo lives in `examples/react-demo/`:
+
+```bash
+pnpm install
+pnpm run demo   # builds wasm + js, then runs vite dev server
+```
+
+## Continuous Integration & Deployment
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **`ci.yml`** runs on every push to `main` and on every PR. Builds
+  the workspace, runs all non-`#[ignore]`'d tests (synthetic
+  primitives included), and exercises the WASM build via `wasm-pack`.
+  ABC dataset diagnostics are skipped — they need ~10K STEP files
+  not in the repo.
+
+- **`deploy-demo.yml`** runs on every push to `main` and publishes
+  `examples/react-demo/` to GitHub Pages.
+
+**One-time setup to enable Pages deployment** (manual UI step,
+required after the first `deploy-demo.yml` run lands):
+
+1. Go to the repository's Settings → Pages.
+2. Under "Build and deployment", set "Source" to **"GitHub Actions"**.
+3. Push to `main` (or click "Run workflow" on the deploy action).
+   The deployment URL appears in the workflow run summary —
+   typically `https://<user>.github.io/knot/`.
+
+The Vite config (`examples/react-demo/vite.config.ts`) reads
+`BASE_URL` from the environment so asset paths match the GitHub
+Pages subpath. Local `pnpm dev` runs unaffected; the env var only
+needs to be set during the CI build.
+
 ## Project Structure
 
 ```

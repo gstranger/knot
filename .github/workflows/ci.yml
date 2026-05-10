@@ -1,0 +1,94 @@
+name: CI
+
+# Build the workspace and run all non-ignored tests on every push to
+# main and on every PR. Tests marked `#[ignore]` (the ABC dataset
+# diagnostics — they need ~10K STEP files at data/abc/) are excluded.
+# The synthetic primitive harness (~20s) IS run.
+#
+# WASM build is exercised separately so a regression that only
+# manifests in the wasm32 target (e.g. std::time::Instant panics) is
+# caught here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs of this workflow when a new commit lands —
+# only the latest commit's CI matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducible builds: pin to a specific Rust release to avoid
+  # toolchain drift between runs. Bump deliberately.
+  RUST_TOOLCHAIN: "1.83.0"
+
+jobs:
+  rust:
+    name: Rust workspace (build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinguish from the wasm build below so caches don't collide.
+          shared-key: rust-native
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Run lib tests
+        run: cargo test --workspace --lib --locked
+
+      - name: Run integration tests (excluding #[ignore])
+        run: cargo test --workspace --tests --locked
+
+  wasm-build:
+    name: WASM build (knot-bindings → pkg/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache (wasm)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-wasm
+
+      - name: Install wasm-pack
+        # Pinned binary install instead of `cargo install` for speed.
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.13.1"
+
+      - name: Build WASM bindings
+        # Same incantation as `pnpm run build:wasm`.
+        run: |
+          wasm-pack build --target web --out-dir pkg
+          node scripts/fix-pkg-name.mjs
+
+      - name: Upload pkg artifact
+        # The deploy-demo workflow re-builds, but uploading here gives
+        # PR reviewers a downloadable artifact for manual smoke testing.
+        uses: actions/upload-artifact@v4
+        with:
+          name: knot-wasm-pkg
+          path: pkg/
+          retention-days: 7
