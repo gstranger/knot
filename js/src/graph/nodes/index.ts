@@ -10,14 +10,14 @@ import { makeBoxNode } from './box';
 import { makeSphereNode } from './sphere';
 import { makeBooleanNode } from './boolean';
 import {
-  makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode,
+  makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode, OffsetNode,
 } from './curve';
 import { makeTriangleNode } from './profile';
 import { makeLoft2Node, makeLoft3Node } from './loft';
 
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { makeBoxNode, makeSphereNode, makeBooleanNode };
-export { makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode };
+export { makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode, OffsetNode };
 export { makeTriangleNode };
 export { makeLoft2Node, makeLoft3Node };
 export type { ViewConstants } from './view';
@@ -37,6 +37,7 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     ViewNode,
     PointAtNode,
     DivideNode,
+    OffsetNode,
     makeBoxNode(knot),
     makeSphereNode(knot),
     makeBooleanNode(knot),

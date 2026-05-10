@@ -20,16 +20,25 @@ export interface PortValueByKind {
   curve: Curve;
 }
 
-/** A typed value flowing on a wire, or an error sentinel. */
-export type Port<K extends PortKind = PortKind> =
-  | { readonly kind: K; readonly value: PortValueByKind[K] }
-  | { readonly kind: 'error'; readonly message: string; readonly nodeId?: string };
+/** Per-kind value port. Spelled out so TypeScript can narrow on `port.kind`. */
+export type ValuePort = {
+  [K in PortKind]: { readonly kind: K; readonly value: PortValueByKind[K] }
+}[PortKind];
 
-export const errPort = (message: string, nodeId?: string): Port =>
+/** Sentinel that propagates through wires when an upstream node fails. */
+export interface ErrorPort {
+  readonly kind: 'error';
+  readonly message: string;
+  readonly nodeId?: string;
+}
+
+/** A typed value flowing on a wire, or an error sentinel. */
+export type Port = ValuePort | ErrorPort;
+
+export const errPort = (message: string, nodeId?: string): ErrorPort =>
   ({ kind: 'error', message, nodeId });
 
-export const isError = (p: Port): p is { kind: 'error'; message: string; nodeId?: string } =>
-  p.kind === 'error';
+export const isError = (p: Port): p is ErrorPort => p.kind === 'error';
 
 // ── Node definitions ──────────────────────────────────────────
 

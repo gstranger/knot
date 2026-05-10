@@ -1,6 +1,7 @@
 pub mod nurbs;
 pub mod line;
 pub mod arc;
+pub mod offset;
 
 use knot_core::Aabb3;
 use crate::point::{Point3, Vector3};

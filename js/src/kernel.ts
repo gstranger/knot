@@ -166,6 +166,17 @@ export class Curve {
     return { min: { x: b[0]!, y: b[1]!, z: b[2]! }, max: { x: b[3]!, y: b[4]!, z: b[5]! } };
   }
 
+  /**
+   * Offset this curve by `distance` in the plane with the given normal.
+   *
+   * The offset direction at parameter `t` is `planeNormal × tangent(t)`.
+   * Exact only for lines and circular arcs; throws for NURBS and elliptical
+   * arcs (their exact offset is not the same curve type).
+   */
+  offset(distance: number, planeNormal: Vec3): Curve {
+    return new Curve(this._raw.offset(distance, planeNormal.x, planeNormal.y, planeNormal.z));
+  }
+
   /** Release WASM memory. */
   free(): void { this._raw.free(); }
   [Symbol.dispose](): void { this.free(); }

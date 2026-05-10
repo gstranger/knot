@@ -145,6 +145,20 @@ impl JsCurve {
         vec![bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z]
     }
 
+    /// Offset this curve by `distance` in the plane with the given normal.
+    ///
+    /// Exact for lines and circular arcs only. Returns an error for NURBS
+    /// and elliptical arcs (their exact offset is not the same curve type).
+    pub fn offset(&self, distance: f64, nx: f64, ny: f64, nz: f64) -> Result<JsCurve, JsError> {
+        let curve = knot_geom::curve::offset::offset(
+            &self.inner,
+            distance,
+            Vector3::new(nx, ny, nz),
+        )
+        .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(JsCurve { inner: curve })
+    }
+
     /// Curve type as a string: "line", "arc", "elliptical_arc", or "nurbs".
     pub fn curve_type(&self) -> String {
         match &self.inner {

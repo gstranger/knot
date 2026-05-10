@@ -47,6 +47,24 @@ export const makeSweepNode = (knot: Knot) =>
     evaluate: ({ profile, rail }) => ({ brep: knot.sweep(profile, rail) }),
   });
 
+/**
+ * Offset a curve by a constant distance in a named plane.
+ * Exact only for lines and circular arcs (else evaluate produces an error port).
+ */
+export const OffsetNode = defineNode({
+  id: 'core.curve.offset',
+  label: 'Offset',
+  inputs: {
+    curve:       { kind: 'curve' },
+    distance:    { kind: 'number', default: 0 },
+    planeNormal: { kind: 'vec3',   default: Z_AXIS },
+  },
+  outputs: { curve: { kind: 'curve' } },
+  evaluate: ({ curve, distance, planeNormal }) => ({
+    curve: curve.offset(distance, planeNormal),
+  }),
+});
+
 /** Divide a curve into `n` equal-parameter segments; output is the first parameter. */
 export const PointAtNode = defineNode({
   id: 'core.curve.pointAt',
