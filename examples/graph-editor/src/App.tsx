@@ -22,6 +22,7 @@ import { Joyride, type Step, type EventData, STATUS } from 'react-joyride';
 import { createKnot, type Knot, type MeshData } from 'knot-cad';
 import { Graph, Evaluator, buildDefaultRegistry } from 'knot-cad/graph';
 import type { NodeRegistry } from 'knot-cad/graph';
+import { FormView } from 'knot-cad/react';
 
 import { CadNode, type CadNodeData } from './CadNode';
 
@@ -318,6 +319,14 @@ export function App() {
     });
   }, []);
 
+  // Editor / Form mode toggle.
+  //
+  // Form mode hides the palette + node canvas and renders only the
+  // exposed input controls + viewport — useful when sharing a graph
+  // as a tunable "definition" with someone who doesn't need to see
+  // the wiring.
+  const [mode, setMode] = useState<'editor' | 'form'>('editor');
+
   // Tour state
   const [runTour, setRunTour] = useState(false);
   const handleTourEvent = useCallback((data: EventData) => {
@@ -330,8 +339,69 @@ export function App() {
     return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', width: '100vw' }}>Loading kernel…</div>;
   }
 
+  const viewport = (
+    <div data-tour="viewport" style={{ flex: mode === 'form' ? 1 : undefined, width: mode === 'editor' ? 400 : undefined, borderLeft: '1px solid #333' }}>
+      <Canvas camera={{ position: [5, 5, 5], fov: 50 }}>
+        <ambientLight intensity={0.4} />
+        <directionalLight position={[5, 10, 5]} intensity={0.8} />
+        <OrbitControls />
+        {meshes.map((mesh, i) => <BrepMesh key={i} mesh={mesh} />)}
+        <gridHelper args={[10, 10, '#444', '#333']} />
+      </Canvas>
+    </div>
+  );
+
+  const modeToggle = (
+    <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 1000, display: 'flex', background: '#16162a', border: '1px solid #333', borderRadius: 6, padding: 2 }}>
+      {(['editor', 'form'] as const).map((m) => (
+        <button
+          key={m}
+          onClick={() => setMode(m)}
+          style={{
+            background: mode === m ? '#4a9eff' : 'transparent',
+            color: mode === m ? '#0e0e1a' : '#aaa',
+            border: 'none',
+            padding: '6px 14px',
+            borderRadius: 4,
+            cursor: 'pointer',
+            fontSize: 11,
+            fontWeight: 600,
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+          }}
+          title={m === 'editor' ? 'Show palette + node canvas' : 'Hide the graph; expose only inputs'}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (mode === 'form') {
+    return (
+      <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+        {modeToggle}
+        <div style={{ width: 320, background: '#16162a', borderRight: '1px solid #333' }}>
+          {graphRef.current && (
+            <FormView
+              graph={graphRef.current}
+              title="Parameters"
+              onChange={(field) => {
+                evalRef.current?.markDirty(field.nodeId);
+                runEval();
+              }}
+              style={{ height: '100%' }}
+            />
+          )}
+        </div>
+        {viewport}
+      </div>
+    );
+  }
+
   return (
     <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+      {modeToggle}
       <Joyride
         steps={TOUR_STEPS}
         run={runTour}
@@ -407,15 +477,7 @@ export function App() {
       </div>
 
       {/* 3D viewport */}
-      <div data-tour="viewport" style={{ width: 400, borderLeft: '1px solid #333' }}>
-        <Canvas camera={{ position: [5, 5, 5], fov: 50 }}>
-          <ambientLight intensity={0.4} />
-          <directionalLight position={[5, 10, 5]} intensity={0.8} />
-          <OrbitControls />
-          {meshes.map((mesh, i) => <BrepMesh key={i} mesh={mesh} />)}
-          <gridHelper args={[10, 10, '#444', '#333']} />
-        </Canvas>
-      </div>
+      {viewport}
     </div>
   );
 }

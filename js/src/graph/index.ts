@@ -26,4 +26,9 @@ export type { EvaluatorOptions } from './evaluator';
 export { Owned, own } from './owned';
 export type { Disposable } from './owned';
 
+export { extractFormFields, setFormValue } from './form';
+export type {
+  FormField, NumberFormField, BoolFormField, Vec3FormField,
+} from './form';
+
 export * from './nodes';
