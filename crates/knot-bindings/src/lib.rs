@@ -5,6 +5,35 @@ use knot_geom::curve::NurbsCurve;
 use knot_geom::surface::{NurbsSurface, Sphere, Plane};
 use knot_topo::*;
 
+/// Convert a `KernelError` into a `JsError` with a stable, parseable
+/// message format: `"E<code>:<kind>:<detail>"`. Consumers on the JS
+/// side use the matching `KnotError` / `parseKnotError` helpers in
+/// `js/src/error.ts` to discriminate failure modes without parsing
+/// free-form English.
+fn kernel_err_to_js(e: knot_core::KernelError) -> JsError {
+    JsError::new(&format_kernel_error(&e))
+}
+
+fn format_kernel_error(e: &knot_core::KernelError) -> String {
+    use knot_core::KernelError::*;
+    let (code, kind, detail) = match e {
+        InvalidGeometry { code, detail } => (Some(*code), "InvalidGeometry", detail.as_str()),
+        TopoInconsistency { code, detail } => (Some(*code), "TopoInconsistency", detail.as_str()),
+        IntersectionFailure { code, detail } => (Some(*code), "IntersectionFailure", detail.as_str()),
+        OperationFailed { code, detail } => (Some(*code), "OperationFailed", detail.as_str()),
+        InvalidInput { code, detail } => (Some(*code), "InvalidInput", detail.as_str()),
+        Degenerate { code, detail } => (Some(*code), "Degenerate", detail.as_str()),
+        NumericalFailure { code, detail } => (Some(*code), "NumericalFailure", detail.as_str()),
+        // Io has no ErrorCode field; use E000 as a placeholder so the
+        // format is uniform on the JS side.
+        Io { detail } => (None, "Io", detail.as_str()),
+    };
+    match code {
+        Some(c) => format!("{}:{}:{}", c, kind, detail),
+        None => format!("E000:{}:{}", kind, detail),
+    }
+}
+
 /// Returns the kernel version string.
 #[wasm_bindgen]
 pub fn version() -> String {
@@ -31,7 +60,7 @@ pub fn create_nurbs_curve(
         .collect();
 
     let curve = NurbsCurve::new(pts, weights.to_vec(), knots.to_vec(), degree)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
 
     Ok(JsCurve { inner: knot_geom::curve::Curve::Nurbs(curve) })
 }
@@ -155,7 +184,7 @@ impl JsCurve {
             distance,
             Vector3::new(nx, ny, nz),
         )
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
         Ok(JsCurve { inner: curve })
     }
 
@@ -258,7 +287,7 @@ impl JsCurve {
             &other.inner,
             tolerance,
         )
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
         let mut out = Vec::with_capacity(hits.len() * 5);
         for h in hits {
             out.push(h.param_a.0);
@@ -316,7 +345,7 @@ pub fn create_nurbs_surface(
         pts, weights.to_vec(),
         knots_u.to_vec(), knots_v.to_vec(),
         degree_u, degree_v, count_u, count_v,
-    ).map_err(|e| JsError::new(&e.to_string()))?;
+    ).map_err(kernel_err_to_js)?;
 
     Ok(JsSurface { inner: SurfaceKind::Nurbs(surface) })
 }
@@ -484,7 +513,7 @@ impl JsBrep {
             max_edge_length,
         };
         let mesh = knot_tessellate::tessellate(&self.inner, opts)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+            .map_err(kernel_err_to_js)?;
         Ok(JsSurfaceMesh {
             positions: mesh.positions_flat(),
             normals: mesh.normals_flat(),
@@ -495,7 +524,7 @@ impl JsBrep {
 
     /// Validate the BRep topology. Throws on error.
     pub fn validate(&self) -> Result<(), JsError> {
-        self.inner.validate().map_err(|e| JsError::new(&e.to_string()))
+        self.inner.validate().map_err(kernel_err_to_js)
     }
 
     /// Axis-aligned bounding box: returns [min_x, min_y, min_z, max_x, max_y, max_z].
@@ -515,28 +544,28 @@ impl JsBrep {
 
     /// Serialize to CBOR bytes for persistence.
     pub fn to_cbor(&self) -> Result<Vec<u8>, JsError> {
-        knot_io::to_cbor(&self.inner).map_err(|e| JsError::new(&e.to_string()))
+        knot_io::to_cbor(&self.inner).map_err(kernel_err_to_js)
     }
 
     /// Export the BRep as binary STL bytes.
     pub fn to_stl(&self) -> Result<Vec<u8>, JsError> {
         let mesh = knot_tessellate::tessellate(&self.inner, knot_tessellate::TessellateOptions::default())
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        knot_io::to_stl(&mesh).map_err(|e| JsError::new(&e.to_string()))
+            .map_err(kernel_err_to_js)?;
+        knot_io::to_stl(&mesh).map_err(kernel_err_to_js)
     }
 
     /// Export the BRep as GLB (binary glTF 2.0) bytes.
     pub fn to_glb(&self) -> Result<Vec<u8>, JsError> {
         let mesh = knot_tessellate::tessellate(&self.inner, knot_tessellate::TessellateOptions::default())
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        knot_io::to_glb(&mesh).map_err(|e| JsError::new(&e.to_string()))
+            .map_err(kernel_err_to_js)?;
+        knot_io::to_glb(&mesh).map_err(kernel_err_to_js)
     }
 
     /// Translate (move) this BRep by (dx, dy, dz), returning a new BRep.
     pub fn translate(&self, dx: f64, dy: f64, dz: f64) -> Result<JsBrep, JsError> {
         let iso = knot_geom::transform::translation(knot_geom::Vector3::new(dx, dy, dz));
         let brep = knot_ops::transform_brep(&self.inner, &iso)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+            .map_err(kernel_err_to_js)?;
         Ok(JsBrep { inner: brep })
     }
 
@@ -550,7 +579,7 @@ impl JsBrep {
         }
         let iso = knot_geom::transform::rotation(axis / len, angle);
         let brep = knot_ops::transform_brep(&self.inner, &iso)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+            .map_err(kernel_err_to_js)?;
         Ok(JsBrep { inner: brep })
     }
 
@@ -561,7 +590,7 @@ impl JsBrep {
     /// error on analytical curved surfaces (spheres, cylinders, etc.).
     pub fn scale(&self, sx: f64, sy: f64, sz: f64) -> Result<JsBrep, JsError> {
         let brep = knot_ops::scale_brep(&self.inner, sx, sy, sz)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+            .map_err(kernel_err_to_js)?;
         Ok(JsBrep { inner: brep })
     }
 }
@@ -609,20 +638,20 @@ pub fn create_profile(points: &[f64], stride: u32) -> Result<JsBrep, JsError> {
         edges.push(HalfEdge::new(edge, true));
     }
     let loop_ = Loop::new(edges, true)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     let surface = std::sync::Arc::new(
         knot_geom::surface::Surface::Plane(
             knot_geom::surface::Plane::new(pts[0], normal)
         )
     );
     let face = Face::new(surface, loop_, vec![], true)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     let shell = Shell::new(vec![face], false)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     let solid = Solid::new(shell, vec![])
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     let brep = knot_topo::BRep::new(vec![solid])
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -636,7 +665,7 @@ pub fn extrude(profile: &JsBrep, dx: f64, dy: f64, dz: f64, distance: f64) -> Re
         &profile.inner,
         Vector3::new(dx, dy, dz),
         distance,
-    ).map_err(|e| JsError::new(&e.to_string()))?;
+    ).map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -658,7 +687,7 @@ pub fn revolve_brep(
         Point3::new(ox, oy, oz),
         Vector3::new(ax, ay, az),
         angle,
-    ).map_err(|e| JsError::new(&e.to_string()))?;
+    ).map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -670,7 +699,7 @@ pub fn revolve_brep(
 #[wasm_bindgen]
 pub fn sweep(profile: &JsBrep, rail: &JsCurve) -> Result<JsBrep, JsError> {
     let brep = knot_ops::sweep_1rail(&profile.inner, &rail.inner)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -682,7 +711,7 @@ pub fn sweep(profile: &JsBrep, rail: &JsCurve) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn loft2(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
     let brep = knot_ops::loft(&[a.inner.clone(), b.inner.clone()])
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -694,7 +723,7 @@ pub fn loft2(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn loft3(a: &JsBrep, b: &JsBrep, c: &JsBrep) -> Result<JsBrep, JsError> {
     let brep = knot_ops::loft(&[a.inner.clone(), b.inner.clone(), c.inner.clone()])
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -724,7 +753,7 @@ fn newell_normal_js(pts: &[Point3]) -> Vector3 {
 pub fn fillet_edges(brep: &JsBrep, edge_points: &[f64], radius: f64) -> Result<JsBrep, JsError> {
     let edges = parse_edge_pairs(edge_points)?;
     let result = knot_ops::fillet(&brep.inner, &edges, radius)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: result })
 }
 
@@ -735,7 +764,7 @@ pub fn fillet_edges(brep: &JsBrep, edge_points: &[f64], radius: f64) -> Result<J
 pub fn chamfer_edges(brep: &JsBrep, edge_points: &[f64], distance: f64) -> Result<JsBrep, JsError> {
     let edges = parse_edge_pairs(edge_points)?;
     let result = knot_ops::chamfer(&brep.inner, &edges, distance)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: result })
 }
 
@@ -755,7 +784,7 @@ fn parse_edge_pairs(flat: &[f64]) -> Result<Vec<(Point3, Point3)>, JsError> {
 #[wasm_bindgen]
 pub fn from_cbor(data: &[u8]) -> Result<JsBrep, JsError> {
     let brep = knot_io::from_cbor(data)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -763,7 +792,7 @@ pub fn from_cbor(data: &[u8]) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn import_step(step_string: &str) -> Result<JsBrep, JsError> {
     let brep = knot_io::from_step(step_string)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -771,14 +800,14 @@ pub fn import_step(step_string: &str) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn export_step(brep: &JsBrep) -> Result<String, JsError> {
     knot_io::to_step(&brep.inner)
-        .map_err(|e| JsError::new(&e.to_string()))
+        .map_err(kernel_err_to_js)
 }
 
 /// Create a box BRep centered at the origin.
 #[wasm_bindgen]
 pub fn create_box(sx: f64, sy: f64, sz: f64) -> Result<JsBrep, JsError> {
     let brep = knot_ops::primitives::make_box(sx, sy, sz)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -787,7 +816,7 @@ pub fn create_box(sx: f64, sy: f64, sz: f64) -> Result<JsBrep, JsError> {
 pub fn create_sphere_brep(cx: f64, cy: f64, cz: f64, radius: f64, n_lon: u32, n_lat: u32) -> Result<JsBrep, JsError> {
     let brep = knot_ops::primitives::make_sphere(
         Point3::new(cx, cy, cz), radius, n_lon, n_lat,
-    ).map_err(|e| JsError::new(&e.to_string()))?;
+    ).map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -796,7 +825,7 @@ pub fn create_sphere_brep(cx: f64, cy: f64, cz: f64, radius: f64, n_lon: u32, n_
 pub fn create_cylinder_brep(cx: f64, cy: f64, cz: f64, radius: f64, height: f64, n_sides: u32) -> Result<JsBrep, JsError> {
     let brep = knot_ops::primitives::make_cylinder(
         Point3::new(cx, cy, cz), radius, height, n_sides,
-    ).map_err(|e| JsError::new(&e.to_string()))?;
+    ).map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: brep })
 }
 
@@ -804,7 +833,7 @@ pub fn create_cylinder_brep(cx: f64, cy: f64, cz: f64, radius: f64, height: f64,
 #[wasm_bindgen]
 pub fn boolean_union(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
     let result = knot_ops::boolean::boolean(&a.inner, &b.inner, knot_ops::BooleanOp::Union)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: result })
 }
 
@@ -812,7 +841,7 @@ pub fn boolean_union(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn boolean_intersection(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
     let result = knot_ops::boolean::boolean(&a.inner, &b.inner, knot_ops::BooleanOp::Intersection)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: result })
 }
 
@@ -820,6 +849,6 @@ pub fn boolean_intersection(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
 #[wasm_bindgen]
 pub fn boolean_subtraction(a: &JsBrep, b: &JsBrep) -> Result<JsBrep, JsError> {
     let result = knot_ops::boolean::boolean(&a.inner, &b.inner, knot_ops::BooleanOp::Subtraction)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        .map_err(kernel_err_to_js)?;
     Ok(JsBrep { inner: result })
 }

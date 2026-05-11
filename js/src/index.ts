@@ -15,3 +15,6 @@ export type {
   ArcOptions,
   NurbsCurveOptions,
 } from './kernel';
+
+export { KnotError, parseKnotError, isKnotError } from './error';
+export type { KnotErrorCode, KnotErrorKind } from './error';
