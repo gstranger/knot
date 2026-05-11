@@ -3,6 +3,29 @@
   "version": "0.1.0",
   "type": "module",
   "description": "TypeScript/React bindings for the Knot NURBS CAD kernel",
+  "license": "MIT",
+  "author": "Garrett Stranger",
+  "homepage": "https://github.com/gstranger/knot",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gstranger/knot.git",
+    "directory": "js"
+  },
+  "bugs": {
+    "url": "https://github.com/gstranger/knot/issues"
+  },
+  "keywords": [
+    "cad",
+    "nurbs",
+    "brep",
+    "boolean",
+    "geometry",
+    "parametric",
+    "node-graph",
+    "react",
+    "three",
+    "wasm"
+  ],
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -25,7 +48,9 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",

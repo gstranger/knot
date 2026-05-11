@@ -1,6 +1,7 @@
 # knot-cad
 
-TypeScript/React bindings for the [Knot](../) NURBS CAD kernel.
+TypeScript/React bindings for the [Knot](https://github.com/gstranger/knot)
+NURBS CAD kernel.
 
 Knot is a BREP modeling kernel written in Rust, compiled to WebAssembly. This package wraps the raw WASM bindings with an ergonomic TypeScript API and optional React Three Fiber components for 3D rendering.
 

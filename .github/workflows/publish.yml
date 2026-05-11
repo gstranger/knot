@@ -1,0 +1,136 @@
+name: Publish
+
+# Triggered by pushing a `vX.Y.Z` tag. Builds the WASM package in
+# release mode, sets both packages' versions from the tag, then
+# publishes `knot-wasm` first and `knot-cad` second (the latter
+# depends on the former via `workspace:*`, which pnpm rewrites to
+# `^X.Y.Z` at publish time).
+#
+# Requires repo secret `NPM_TOKEN` — a granular npm access token
+# scoped to `knot-wasm` + `knot-cad` with publish + write
+# permissions. (Account → Access Tokens on npmjs.com.)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.85.0"
+
+jobs:
+  publish:
+    name: Build + publish knot-wasm and knot-cad
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # for npm provenance, when we opt in
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        # tag is `refs/tags/vX.Y.Z`; strip the prefix to get the
+        # numeric version we'll stamp into both package.jsons.
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $version"
+
+      # ── Toolchains ──────────────────────────────────────────────
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-wasm
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.13.1"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      # ── Build ──────────────────────────────────────────────────
+
+      - name: Build WASM (release)
+        run: |
+          wasm-pack build --target web --out-dir pkg --release
+          node scripts/fix-pkg-name.mjs
+
+      - name: Install JS dependencies
+        run: pnpm install
+
+      - name: Run knot-cad tests
+        # Sanity gate: never publish a release that fails its own
+        # JS tests. (The full ABC harness runs in CI on every push;
+        # this is a tighter check.)
+        run: pnpm --filter knot-cad test
+
+      - name: Build knot-cad
+        run: pnpm --filter knot-cad build
+
+      # ── Stamp versions ──────────────────────────────────────────
+
+      - name: Set version on both packages
+        # Tag-driven release: rewrite version fields so the
+        # tarballs ship with the right number. Use `pnpm pkg set`
+        # rather than `npm version` to avoid creating extra git
+        # commits / tags inside the CI workspace.
+        run: |
+          set -e
+          v="${{ steps.version.outputs.version }}"
+          pnpm --filter knot-wasm pkg set version="$v"
+          pnpm --filter knot-cad pkg set version="$v"
+          # Pin the knot-cad → knot-wasm dep to the exact version
+          # we just published, so pnpm doesn't leave `workspace:*`
+          # in the tarball.
+          pnpm --filter knot-cad pkg set "dependencies.knot-wasm=^$v"
+
+      # ── Publish ────────────────────────────────────────────────
+
+      - name: Publish knot-wasm
+        working-directory: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Wait for knot-wasm to be resolvable
+        # The npm registry has a brief CDN propagation window;
+        # publishing knot-cad immediately can fail to resolve the
+        # newly-published knot-wasm dependency.
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsSL "https://registry.npmjs.org/knot-wasm/$v" > /dev/null; then
+              echo "knot-wasm@$v is resolvable"
+              exit 0
+            fi
+            echo "attempt $i: not yet resolvable, sleeping 10s"
+            sleep 10
+          done
+          echo "knot-wasm@$v never became resolvable"
+          exit 1
+
+      - name: Publish knot-cad
+        working-directory: js
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
