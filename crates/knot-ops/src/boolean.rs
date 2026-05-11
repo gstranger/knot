@@ -488,26 +488,116 @@ fn find_candidate_pairs(faces_a: &[&Face], faces_b: &[&Face], tolerance: f64) ->
     //
     // BVH/bbox overlap leaves many pairs that can't actually intersect:
     // two parallel plates above each other share an XY bbox but their
-    // surfaces are separated along the normal. For analytical carriers
-    // (plane, sphere, cylinder) we can compute a closed-form
-    // signed-distance range from the carrier's implicit form to the
-    // other face's vertices, and drop pairs where the range stays
-    // strictly on one side beyond `tolerance`.
+    // surfaces are separated along the normal. We apply two filters:
     //
-    // Conservative: never drop a pair that could possibly intersect.
-    // NURBS carriers are skipped (no cheap implicit), so the BVH-only
-    // result remains an upper bound. In practice on CAD chunks like
-    // ABC, ~80% of faces are planes, so the prune is dominated by
-    // plane-side culling.
+    // 1. Implicit-form prune (Plane / Sphere / Cylinder carriers):
+    //    use the carrier's implicit equation to test whether the other
+    //    face's vertices all lie on one side beyond tolerance.
+    //
+    // 2. SAT prune along each face's centroid normal:
+    //    sample BOTH faces' surfaces (boundary + parametric grid) and
+    //    project onto each face's polygon-normal axis. If the two
+    //    projection ranges are disjoint beyond tolerance, the faces
+    //    can't meet. This handles NURBS-vs-NURBS and NURBS-vs-analytic
+    //    pairs that the implicit prune skips.
+    //
+    // Both are conservative: a pair is dropped only when it's
+    // geometrically impossible to intersect within tolerance.
     let pts_a: Vec<Vec<Point3>> = faces_a.iter().map(|f| face_loop_points(f)).collect();
     let pts_b: Vec<Vec<Point3>> = faces_b.iter().map(|f| face_loop_points(f)).collect();
+    let surf_samples_a: Vec<Vec<Point3>> = faces_a.iter().map(|f| face_surface_samples(f)).collect();
+    let surf_samples_b: Vec<Vec<Point3>> = faces_b.iter().map(|f| face_surface_samples(f)).collect();
+    let normals_a: Vec<Vector3> = faces_a.iter().map(|f| face_avg_normal(f)).collect();
+    let normals_b: Vec<Vector3> = faces_b.iter().map(|f| face_avg_normal(f)).collect();
     bvh_pairs
         .into_iter()
         .filter(|&(ia, ib)| {
-            !surface_separates(faces_a[ia].surface(), &pts_b[ib], tolerance)
-                && !surface_separates(faces_b[ib].surface(), &pts_a[ia], tolerance)
+            if surface_separates(faces_a[ia].surface(), &pts_b[ib], tolerance) {
+                return false;
+            }
+            if surface_separates(faces_b[ib].surface(), &pts_a[ia], tolerance) {
+                return false;
+            }
+            if sat_separated_along(&normals_a[ia], &surf_samples_a[ia], &surf_samples_b[ib], tolerance) {
+                return false;
+            }
+            if sat_separated_along(&normals_b[ib], &surf_samples_a[ia], &surf_samples_b[ib], tolerance) {
+                return false;
+            }
+            true
         })
         .collect()
+}
+
+/// Surface samples for a face — outer-loop vertices plus a 3×3
+/// parametric grid on the underlying surface. The grid captures
+/// the surface's actual extent (e.g. a curved NURBS face bulging
+/// past its boundary AABB), which is required for SAT pruning to
+/// be conservative when the face is curved.
+///
+/// For analytic surfaces with infinite domains (Plane) the boundary
+/// vertices already bound the face exactly, so no extra samples are
+/// added. For finite-domain surfaces (Sphere, Cylinder, Cone, Torus,
+/// NURBS) the parametric grid runs over the SURFACE'S natural
+/// domain — for partially-trimmed faces this oversamples (samples
+/// outside the actual face region), which keeps the resulting range
+/// a safe over-approximation.
+fn face_surface_samples(face: &Face) -> Vec<Point3> {
+    let mut pts = face_loop_points(face);
+    let dom = face.surface().domain();
+    if !dom.u_start.is_finite()
+        || !dom.u_end.is_finite()
+        || !dom.v_start.is_finite()
+        || !dom.v_end.is_finite()
+    {
+        return pts;
+    }
+    for i in 0..=2 {
+        for j in 0..=2 {
+            let u = dom.u_start + (dom.u_end - dom.u_start) * i as f64 / 2.0;
+            let v = dom.v_start + (dom.v_end - dom.v_start) * j as f64 / 2.0;
+            pts.push(face.surface().point_at(SurfaceParam { u, v }));
+        }
+    }
+    pts
+}
+
+/// Polygon normal of a face's outer loop (Newell's method).
+/// Used as a SAT candidate-separating-axis direction. Geometric,
+/// no inverse-mapping required, well-defined even for face
+/// regions whose parametric extent we don't track.
+fn face_avg_normal(face: &Face) -> Vector3 {
+    compute_polygon_normal(&face_loop_points(face))
+}
+
+/// Separating-axis test along `axis`: project both point sets onto
+/// the axis and check whether their projection ranges are disjoint
+/// by more than `tol`. Returns `true` if the axis separates the two
+/// point sets (no possible contact).
+fn sat_separated_along(
+    axis: &Vector3,
+    pts_a: &[Point3],
+    pts_b: &[Point3],
+    tol: f64,
+) -> bool {
+    if axis.norm_squared() < 1e-24 {
+        return false; // degenerate axis — can't separate
+    }
+    let mut min_a = f64::INFINITY;
+    let mut max_a = f64::NEG_INFINITY;
+    for p in pts_a {
+        let s = axis.dot(&p.coords);
+        if s < min_a { min_a = s; }
+        if s > max_a { max_a = s; }
+    }
+    let mut min_b = f64::INFINITY;
+    let mut max_b = f64::NEG_INFINITY;
+    for p in pts_b {
+        let s = axis.dot(&p.coords);
+        if s < min_b { min_b = s; }
+        if s > max_b { max_b = s; }
+    }
+    min_b > max_a + tol || max_b < min_a - tol
 }
 
 fn face_loop_points(face: &Face) -> Vec<Point3> {
