@@ -123,11 +123,21 @@ impl StepFile {
         self.entities.get(&id)
     }
 
-    /// Find all entities with a given type name.
+    /// Find all entities with a given type name, sorted by entity id.
+    ///
+    /// HashMap iteration order is randomized per-process (SipHash
+    /// seed). When a STEP file has multiple matching entities — e.g.
+    /// multiple `MANIFOLD_SOLID_BREP` in a file — callers that pick
+    /// "the first that imports" would otherwise get a different
+    /// solid each run, producing different face counts and tripping
+    /// reliability harnesses non-deterministically. Sorting by entity
+    /// id gives a stable file-order traversal.
     pub fn entities_of_type(&self, name: &str) -> Vec<&Entity> {
-        self.entities.values()
+        let mut out: Vec<&Entity> = self.entities.values()
             .filter(|e| e.name.eq_ignore_ascii_case(name))
-            .collect()
+            .collect();
+        out.sort_by_key(|e| e.id);
+        out
     }
 }
 

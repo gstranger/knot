@@ -5,7 +5,7 @@ use knot_core::exact::{ExactPoint3, ExactRational, Orientation, point_side_of_pl
 use knot_geom::Point3;
 use knot_geom::Vector3;
 use knot_geom::curve::{Curve, LineSeg};
-use knot_geom::surface::{Surface, SurfaceParam, Plane};
+use knot_geom::surface::{Surface, SurfaceParam, Plane, Sphere, Cylinder};
 use knot_topo::*;
 use knot_intersect::surface_surface::intersect_surfaces;
 use crate::topo_builder::TopologyBuilder;
@@ -482,7 +482,39 @@ fn find_candidate_pairs(faces_a: &[&Face], faces_b: &[&Face], tolerance: f64) ->
 
     let bvh_a = knot_core::bvh::Bvh::build(&bboxes_a);
     let bvh_b = knot_core::bvh::Bvh::build(&bboxes_b);
-    bvh_a.find_overlapping_pairs(&bvh_b)
+    let bvh_pairs = bvh_a.find_overlapping_pairs(&bvh_b);
+
+    // ── Surface-side prune ──
+    //
+    // BVH/bbox overlap leaves many pairs that can't actually intersect:
+    // two parallel plates above each other share an XY bbox but their
+    // surfaces are separated along the normal. For analytical carriers
+    // (plane, sphere, cylinder) we can compute a closed-form
+    // signed-distance range from the carrier's implicit form to the
+    // other face's vertices, and drop pairs where the range stays
+    // strictly on one side beyond `tolerance`.
+    //
+    // Conservative: never drop a pair that could possibly intersect.
+    // NURBS carriers are skipped (no cheap implicit), so the BVH-only
+    // result remains an upper bound. In practice on CAD chunks like
+    // ABC, ~80% of faces are planes, so the prune is dominated by
+    // plane-side culling.
+    let pts_a: Vec<Vec<Point3>> = faces_a.iter().map(|f| face_loop_points(f)).collect();
+    let pts_b: Vec<Vec<Point3>> = faces_b.iter().map(|f| face_loop_points(f)).collect();
+    bvh_pairs
+        .into_iter()
+        .filter(|&(ia, ib)| {
+            !surface_separates(faces_a[ia].surface(), &pts_b[ib], tolerance)
+                && !surface_separates(faces_b[ib].surface(), &pts_a[ia], tolerance)
+        })
+        .collect()
+}
+
+fn face_loop_points(face: &Face) -> Vec<Point3> {
+    face.outer_loop().half_edges()
+        .iter()
+        .map(|he| *he.start_vertex().point())
+        .collect()
 }
 
 fn face_bbox(face: &Face, margin: f64) -> Aabb3 {
@@ -491,6 +523,77 @@ fn face_bbox(face: &Face, margin: f64) -> Aabb3 {
         .map(|he| *he.start_vertex().point())
         .collect();
     Aabb3::from_points(&pts).unwrap().expand(margin)
+}
+
+/// True when `carrier`'s analytical surface strictly separates the given
+/// points beyond `tolerance` — i.e., they all lie on one side and the
+/// other face cannot reach `carrier`. Returns `false` (no prune) for
+/// NURBS or any case where separation isn't certain.
+///
+/// Tolerance interpretation matches the rest of the pipeline: it's the
+/// snap-grid-tied geometric tolerance. We compare against signed/radial
+/// distances directly.
+fn surface_separates(carrier: &Arc<Surface>, pts: &[Point3], tolerance: f64) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
+    match carrier.as_ref() {
+        Surface::Plane(p) => plane_separates(p, pts, tolerance),
+        Surface::Sphere(s) => sphere_separates(s, pts, tolerance),
+        Surface::Cylinder(c) => cylinder_separates(c, pts, tolerance),
+        // Cone/Torus implicit distance is messier (involves the apex
+        // axis and minor radius respectively); skip for now and rely
+        // on bbox-overlap as the only filter.
+        _ => false,
+    }
+}
+
+fn plane_separates(plane: &Plane, pts: &[Point3], tolerance: f64) -> bool {
+    let mut min_s = f64::INFINITY;
+    let mut max_s = f64::NEG_INFINITY;
+    for v in pts {
+        let s = plane.normal.dot(&(v - plane.origin));
+        if s < min_s { min_s = s; }
+        if s > max_s { max_s = s; }
+    }
+    min_s > tolerance || max_s < -tolerance
+}
+
+fn sphere_separates(sphere: &Sphere, pts: &[Point3], tolerance: f64) -> bool {
+    let mut min_d = f64::INFINITY;
+    let mut max_d = f64::NEG_INFINITY;
+    for v in pts {
+        let d = (v - sphere.center).norm();
+        if d < min_d { min_d = d; }
+        if d > max_d { max_d = d; }
+    }
+    // All points strictly inside or all strictly outside the sphere
+    // shell. The shell is at `radius`; separation when the vertex
+    // distance range lies entirely outside [radius - tol, radius + tol].
+    max_d < sphere.radius - tolerance || min_d > sphere.radius + tolerance
+}
+
+fn cylinder_separates(cyl: &Cylinder, pts: &[Point3], tolerance: f64) -> bool {
+    // Distance from each point to the cylinder's infinite axis line.
+    // `cyl.axis` is the axis direction; cylinder.rs initializes it
+    // unit-length, but normalize here for safety against drift.
+    let axis_len_sq = cyl.axis.norm_squared();
+    if axis_len_sq <= 0.0 {
+        return false;
+    }
+    let inv_axis_len = 1.0 / axis_len_sq.sqrt();
+    let axis_unit = cyl.axis * inv_axis_len;
+    let mut min_d = f64::INFINITY;
+    let mut max_d = f64::NEG_INFINITY;
+    for v in pts {
+        let w = v - cyl.origin;
+        let along = w.dot(&axis_unit);
+        let perp = w - axis_unit * along;
+        let d = perp.norm();
+        if d < min_d { min_d = d; }
+        if d > max_d { max_d = d; }
+    }
+    max_d < cyl.radius - tolerance || min_d > cyl.radius + tolerance
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -30,6 +30,16 @@ fn pair_paths() -> Vec<(PathBuf, PathBuf, &'static str)> {
             base.join("0000/00000025/00000025_ad34a3f60c4a4caa99646600_step_005.step"),
             "(24, 25)",
         ),
+        (
+            base.join("0000/00000012/00000012_f16882934f314832b639ffc0_step_000.step"),
+            base.join("0000/00000014/00000014_5b1c2f8a8c6f40fdaae1e69d_step_000.step"),
+            "(12, 14)",
+        ),
+        (
+            base.join("0000/00000001/00000001_1ffb81a71e5b402e966b9341_step_000.step"),
+            base.join("0000/00000003/00000003_1ffb81a71e5b402e966b9341_step_000.step"),
+            "(01, 03)",
+        ),
     ]
 }
 
