@@ -18,7 +18,7 @@ export type {
 export { errPort, isError } from './types';
 
 export { Graph, Registry } from './graph';
-export type { NodeRegistry } from './graph';
+export type { NodeRegistry, GraphData } from './graph';
 
 export { Evaluator } from './evaluator';
 export type { EvaluatorOptions } from './evaluator';

@@ -1,5 +1,26 @@
 import type { NodeDef, NodeId, NodeInstance, PortName, Wire, InputMap, OutputMap } from './types';
 
+/**
+ * On-disk JSON shape of a Graph. Stable across kernel/JS versions
+ * within the same `schemaVersion` — bump it when the layout changes
+ * incompatibly so old saves can be migrated or rejected with a clear
+ * error.
+ *
+ * Holds NO kernel objects: nodes' `constants` carry only primitives,
+ * vec3 records, and JSON-serializable arrays. Geometry is recomputed
+ * by re-running the evaluator after `fromJSON`.
+ */
+export interface GraphData {
+  readonly schemaVersion: 1;
+  readonly nextId: number;
+  readonly nodes: ReadonlyArray<{
+    readonly id: NodeId;
+    readonly defId: string;
+    readonly constants: Readonly<Record<string, unknown>>;
+  }>;
+  readonly wires: readonly Wire[];
+}
+
 export interface NodeRegistry {
   get(defId: string): NodeDef<InputMap, OutputMap> | undefined;
 }
@@ -185,4 +206,94 @@ export class Graph {
   private detectCycle(): boolean {
     try { this.topoSort(); return false; } catch { return true; }
   }
+
+  // ── Serialization ────────────────────────────────────────────
+
+  /**
+   * Snapshot the graph as plain JSON-serializable data. Use
+   * `JSON.stringify(graph.toJSON())` to write to disk. Round-trip
+   * via `Graph.fromJSON(data, registry)`.
+   *
+   * Throws if a node's constants include a value JSON can't carry
+   * (functions, BigInts, kernel handles like Brep/Curve). Constants
+   * should hold primitives and vec3 records only — geometry flows
+   * through wires, not through constants.
+   */
+  toJSON(): GraphData {
+    const nodes = [...this._nodes.values()].map(n => {
+      const constants: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(n.constants)) {
+        assertJsonSafe(v, `node '${n.id}'.constants.${k}`);
+        constants[k] = v;
+      }
+      return { id: n.id, defId: n.defId, constants };
+    });
+    return {
+      schemaVersion: 1,
+      nextId: this._nextId,
+      nodes,
+      wires: this._wires.map(w => ({ ...w })),
+    };
+  }
+
+  /**
+   * Rebuild a Graph from a previously-serialized snapshot. The
+   * `registry` must contain definitions for every `defId` the
+   * snapshot references; missing defs produce a clear error rather
+   * than a half-loaded graph. Wires are validated for kind-match
+   * the same way `connect` validates them at edit time.
+   */
+  static fromJSON(data: GraphData, registry: NodeRegistry): Graph {
+    if (data.schemaVersion !== 1) {
+      throw new Error(`Graph.fromJSON: unsupported schemaVersion ${data.schemaVersion} (expected 1)`);
+    }
+    const missing: string[] = [];
+    for (const n of data.nodes) {
+      if (!registry.get(n.defId)) missing.push(n.defId);
+    }
+    if (missing.length > 0) {
+      const uniq = [...new Set(missing)].sort();
+      throw new Error(`Graph.fromJSON: registry is missing node defs: ${uniq.join(', ')}`);
+    }
+    const g = new Graph(registry);
+    for (const n of data.nodes) {
+      g.addNode(n.defId, n.constants, n.id);
+    }
+    for (const w of data.wires) {
+      // Round-trips through `connect` so kind / cycle validation
+      // protects against tampered or stale JSON.
+      g.connect(w.fromNode, w.fromPort, w.toNode, w.toPort);
+    }
+    g._nextId = Math.max(g._nextId, data.nextId);
+    return g;
+  }
+}
+
+/**
+ * Reject non-JSON-safe values at toJSON time, so a failing save
+ * produces a useful pointer to the offending node/port instead of
+ * a downstream "[object Object]" or "circular reference" error.
+ */
+function assertJsonSafe(v: unknown, path: string): void {
+  if (v === null) return;
+  const t = typeof v;
+  if (t === 'string' || t === 'number' || t === 'boolean') return;
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) assertJsonSafe(v[i], `${path}[${i}]`);
+    return;
+  }
+  if (t === 'object') {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== null && proto !== Object.prototype) {
+      throw new Error(
+        `Graph.toJSON: ${path} is a non-plain object (${proto?.constructor?.name ?? '?'}); ` +
+        `constants can only hold primitives, plain objects, and arrays`,
+      );
+    }
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      assertJsonSafe(val, `${path}.${k}`);
+    }
+    return;
+  }
+  throw new Error(`Graph.toJSON: ${path} is a ${t}, not JSON-safe`);
 }
