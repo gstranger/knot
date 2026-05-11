@@ -52,6 +52,13 @@ import {
   IfNumberNode, IfBoolNode,
 } from './logic';
 
+// ── Analysis ─────────────────────────────────────────────────────
+import {
+  CurveLengthNode, CurveBoundingBoxNode, CurveClosestPointNode,
+  CurveTangentAtNode, CurveDivideByLengthNode, CurveCurveIntersectNode,
+  BrepBoundingBoxNode, BrepFaceCountNode,
+} from './analysis';
+
 // ── Re-exports ───────────────────────────────────────────────────
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { SliderNode, ToggleNode, AddNode, SubtractNode, MultiplyNode, DivideNumNode, NegateNode, AbsNode, SinNode, CosNode, RemapNode, ExpressionNode };
@@ -68,6 +75,11 @@ export {
   GreaterEqualNode, LessEqualNode,
   AndNode, OrNode, NotNode, XorNode,
   IfNumberNode, IfBoolNode,
+};
+export {
+  CurveLengthNode, CurveBoundingBoxNode, CurveClosestPointNode,
+  CurveTangentAtNode, CurveDivideByLengthNode, CurveCurveIntersectNode,
+  BrepBoundingBoxNode, BrepFaceCountNode,
 };
 export type { ViewConstants } from './view';
 export type { BooleanOp } from './boolean';
@@ -111,6 +123,10 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     GreaterEqualNode, LessEqualNode,
     AndNode, OrNode, NotNode, XorNode,
     IfNumberNode, IfBoolNode,
+    // Analysis
+    CurveLengthNode, CurveBoundingBoxNode, CurveClosestPointNode,
+    CurveTangentAtNode, CurveDivideByLengthNode, CurveCurveIntersectNode,
+    BrepBoundingBoxNode, BrepFaceCountNode,
   ];
   for (const d of defs) r.register(d);
   return r;
