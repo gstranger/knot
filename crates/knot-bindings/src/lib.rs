@@ -542,6 +542,39 @@ impl JsBrep {
         Ok(vec![bbox.min.x, bbox.min.y, bbox.min.z, bbox.max.x, bbox.max.y, bbox.max.z])
     }
 
+    /// Enumerate unique edges as a flat float buffer:
+    /// `[x0a,y0a,z0a, x0b,y0b,z0b, x1a,y1a,z1a, ...]` — six floats
+    /// per edge (start XYZ, end XYZ). Same layout the `fillet_edges`
+    /// / `chamfer_edges` entry points consume, so the typical
+    /// graph-side pipeline `brep → edges → fillet` is shape-compatible.
+    ///
+    /// Deduplicates by sorted-vertex-id-pair so each edge appears
+    /// exactly once regardless of how many faces it bounds.
+    pub fn edges(&self) -> Vec<f64> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        let mut out: Vec<f64> = Vec::new();
+        for solid in self.inner.solids() {
+            for face in solid.outer_shell().faces() {
+                let loops_iter = std::iter::once(face.outer_loop())
+                    .chain(face.inner_loops().iter());
+                for loop_ in loops_iter {
+                    for he in loop_.half_edges() {
+                        let edge = he.edge();
+                        let a = edge.start().id().hash_value();
+                        let b = edge.end().id().hash_value();
+                        let key = if a <= b { (a, b) } else { (b, a) };
+                        if !seen.insert(key) { continue; }
+                        let sp = edge.start().point();
+                        let ep = edge.end().point();
+                        out.extend_from_slice(&[sp.x, sp.y, sp.z, ep.x, ep.y, ep.z]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Serialize to CBOR bytes for persistence.
     pub fn to_cbor(&self) -> Result<Vec<u8>, JsError> {
         knot_io::to_cbor(&self.inner).map_err(kernel_err_to_js)

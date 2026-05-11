@@ -377,6 +377,26 @@ export class Brep {
   }
 
   /**
+   * Enumerate this BRep's unique edges as `EdgeRef[]`. Each edge
+   * appears once regardless of how many faces it bounds.
+   *
+   * Useful as input to `fillet` / `chamfer` when you want to operate
+   * on every edge ("round all edges of this part") or to filter the
+   * list down to a subset before applying a modifier.
+   */
+  edges(): EdgeRef[] {
+    const flat = this._raw.edges();
+    const out: EdgeRef[] = [];
+    for (let i = 0; i < flat.length; i += 6) {
+      out.push({
+        start: { x: flat[i]!, y: flat[i + 1]!, z: flat[i + 2]! },
+        end:   { x: flat[i + 3]!, y: flat[i + 4]!, z: flat[i + 5]! },
+      });
+    }
+    return out;
+  }
+
+  /**
    * Fillet (round) edges with a constant radius.
    *
    * Edges are identified by their start/end vertex coordinates.

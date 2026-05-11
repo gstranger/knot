@@ -59,6 +59,11 @@ import {
   BrepBoundingBoxNode, BrepFaceCountNode,
 } from './analysis';
 
+// ── Modify ───────────────────────────────────────────────────────
+import {
+  BrepEdgesNode, makeFilletNode, makeChamferNode,
+} from './modify';
+
 // ── Re-exports ───────────────────────────────────────────────────
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { SliderNode, ToggleNode, AddNode, SubtractNode, MultiplyNode, DivideNumNode, NegateNode, AbsNode, SinNode, CosNode, RemapNode, ExpressionNode };
@@ -81,6 +86,7 @@ export {
   CurveTangentAtNode, CurveDivideByLengthNode, CurveCurveIntersectNode,
   BrepBoundingBoxNode, BrepFaceCountNode,
 };
+export { BrepEdgesNode, makeFilletNode, makeChamferNode };
 export type { ViewConstants } from './view';
 export type { BooleanOp } from './boolean';
 export { defineNode } from './define';
@@ -127,6 +133,8 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     CurveLengthNode, CurveBoundingBoxNode, CurveClosestPointNode,
     CurveTangentAtNode, CurveDivideByLengthNode, CurveCurveIntersectNode,
     BrepBoundingBoxNode, BrepFaceCountNode,
+    // Modify
+    BrepEdgesNode, makeFilletNode(knot), makeChamferNode(knot),
   ];
   for (const d of defs) r.register(d);
   return r;
