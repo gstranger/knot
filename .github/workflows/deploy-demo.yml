@@ -82,17 +82,15 @@ jobs:
       - name: Build knot-cad JS package
         run: pnpm --filter knot-cad build
 
-      - name: Build React demo
-        # BASE_URL is read by examples/react-demo/vite.config.ts so
-        # asset paths resolve under the GitHub Pages subpath.
+      - name: Build graph editor
         env:
           BASE_URL: /${{ github.event.repository.name }}/
-        run: pnpm --filter knot-react-demo build
+        run: pnpm --filter knot-graph-editor build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: examples/react-demo/dist
+          path: examples/graph-editor/dist
 
   deploy:
     name: Deploy to Pages

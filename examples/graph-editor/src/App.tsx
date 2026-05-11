@@ -239,6 +239,16 @@ export function App() {
     [runEval],
   );
 
+  // Accordion state — all groups open by default
+  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(PALETTE.map((g) => g.label)));
+  const toggleGroup = useCallback((label: string) => {
+    setOpenGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label); else next.add(label);
+      return next;
+    });
+  }, []);
+
   if (loading) {
     return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', width: '100vw' }}>Loading kernel…</div>;
   }
@@ -248,23 +258,39 @@ export function App() {
       {/* Palette */}
       <div style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>Add Node</div>
-        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {PALETTE.map((group) => (
-            <div key={group.label}>
-              <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#888', marginBottom: 4, letterSpacing: 1 }}>{group.label}</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                {group.entries.map((p) => (
-                  <button
-                    key={p.defId}
-                    onClick={() => addNode(p.defId)}
-                    style={{ background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
-                  >
-                    {p.label}
-                  </button>
-                ))}
+        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {PALETTE.map((group) => {
+            const isOpen = openGroups.has(group.label);
+            return (
+              <div key={group.label}>
+                <button
+                  onClick={() => toggleGroup(group.label)}
+                  style={{
+                    width: '100%', background: 'none', border: 'none', color: '#888',
+                    fontSize: 10, textTransform: 'uppercase', letterSpacing: 1,
+                    padding: '6px 0 4px', cursor: 'pointer', textAlign: 'left',
+                    display: 'flex', alignItems: 'center', gap: 4,
+                  }}
+                >
+                  <span style={{ display: 'inline-block', width: 10, fontSize: 8, transition: 'transform 0.15s', transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}>&#9654;</span>
+                  {group.label}
+                </button>
+                {isOpen && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingLeft: 2 }}>
+                    {group.entries.map((p) => (
+                      <button
+                        key={p.defId}
+                        onClick={() => addNode(p.defId)}
+                        style={{ background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
