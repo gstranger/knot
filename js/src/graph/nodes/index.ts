@@ -44,6 +44,14 @@ import {
   RepeatNode, FlattenNode,
 } from './list';
 
+// ── Logic ────────────────────────────────────────────────────────
+import {
+  EqualsNode, NotEqualsNode, GreaterNode, LessNode,
+  GreaterEqualNode, LessEqualNode,
+  AndNode, OrNode, NotNode, XorNode,
+  IfNumberNode, IfBoolNode,
+} from './logic';
+
 // ── Re-exports ───────────────────────────────────────────────────
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { SliderNode, ToggleNode, AddNode, SubtractNode, MultiplyNode, DivideNumNode, NegateNode, AbsNode, SinNode, CosNode, RemapNode, ExpressionNode };
@@ -55,6 +63,12 @@ export { makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode, Offs
 export { makeTriangleNode };
 export { makeLoft2Node, makeLoft3Node };
 export { RangeNode, SeriesNode, ListItemNode, ListLengthNode, RepeatNode, FlattenNode };
+export {
+  EqualsNode, NotEqualsNode, GreaterNode, LessNode,
+  GreaterEqualNode, LessEqualNode,
+  AndNode, OrNode, NotNode, XorNode,
+  IfNumberNode, IfBoolNode,
+};
 export type { ViewConstants } from './view';
 export type { BooleanOp } from './boolean';
 export { defineNode } from './define';
@@ -92,6 +106,11 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     makeTriangleNode(knot),
     // List
     RangeNode, SeriesNode, ListItemNode, ListLengthNode, RepeatNode, FlattenNode,
+    // Logic
+    EqualsNode, NotEqualsNode, GreaterNode, LessNode,
+    GreaterEqualNode, LessEqualNode,
+    AndNode, OrNode, NotNode, XorNode,
+    IfNumberNode, IfBoolNode,
   ];
   for (const d of defs) r.register(d);
   return r;
