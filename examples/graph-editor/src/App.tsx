@@ -29,13 +29,59 @@ const nodeTypes: NodeTypes = { cad: CadNode as any };
 
 interface PaletteEntry { defId: string; label: string }
 
-const PALETTE: PaletteEntry[] = [
-  { defId: 'core.number', label: 'Number' },
-  { defId: 'core.vec3', label: 'Vec3' },
-  { defId: 'knot.box', label: 'Box' },
-  { defId: 'knot.sphere', label: 'Sphere' },
-  { defId: 'core.translate', label: 'Translate' },
-  { defId: 'knot.boolean', label: 'Boolean' },
+interface PaletteGroup { label: string; entries: PaletteEntry[] }
+
+const PALETTE: PaletteGroup[] = [
+  { label: 'Input', entries: [
+    { defId: 'core.number', label: 'Number' },
+    { defId: 'core.slider', label: 'Slider' },
+    { defId: 'core.toggle', label: 'Toggle' },
+    { defId: 'core.vec3', label: 'Vec3' },
+  ]},
+  { label: 'Math', entries: [
+    { defId: 'math.add', label: 'Add' },
+    { defId: 'math.subtract', label: 'Subtract' },
+    { defId: 'math.multiply', label: 'Multiply' },
+    { defId: 'math.divide', label: 'Divide' },
+    { defId: 'math.negate', label: 'Negate' },
+    { defId: 'math.sin', label: 'Sin' },
+    { defId: 'math.cos', label: 'Cos' },
+    { defId: 'math.remap', label: 'Remap' },
+    { defId: 'math.expression', label: 'Expression' },
+  ]},
+  { label: 'Vector', entries: [
+    { defId: 'core.deconstructVec3', label: 'Deconstruct' },
+    { defId: 'vec3.add', label: 'Add Vec3' },
+    { defId: 'vec3.scale', label: 'Scale Vec3' },
+    { defId: 'vec3.cross', label: 'Cross' },
+    { defId: 'vec3.dot', label: 'Dot' },
+    { defId: 'vec3.length', label: 'Length' },
+  ]},
+  { label: 'Primitives', entries: [
+    { defId: 'knot.box', label: 'Box' },
+    { defId: 'knot.sphere', label: 'Sphere' },
+    { defId: 'knot.cylinder', label: 'Cylinder' },
+    { defId: 'knot.triangle', label: 'Triangle' },
+  ]},
+  { label: 'Transform', entries: [
+    { defId: 'core.translate', label: 'Translate' },
+    { defId: 'core.rotate', label: 'Rotate' },
+    { defId: 'core.scale', label: 'Scale' },
+  ]},
+  { label: 'Operations', entries: [
+    { defId: 'knot.boolean', label: 'Boolean' },
+    { defId: 'knot.extrude', label: 'Extrude' },
+    { defId: 'knot.revolve', label: 'Revolve' },
+    { defId: 'knot.sweep', label: 'Sweep' },
+    { defId: 'knot.loft2', label: 'Loft (2)' },
+  ]},
+  { label: 'Curve', entries: [
+    { defId: 'knot.line', label: 'Line' },
+    { defId: 'knot.arc', label: 'Arc' },
+    { defId: 'core.curve.pointAt', label: 'Point At' },
+    { defId: 'core.curve.divide', label: 'Divide' },
+    { defId: 'core.curve.offset', label: 'Offset' },
+  ]},
 ];
 
 // ── App ──────────────────────────────────────────────────────────
@@ -98,6 +144,7 @@ export function App() {
       const def = graph.getDef(nodeId);
       const data: CadNodeData = {
         label: def.label ?? def.id,
+        defId: def.id,
         inputs: Object.entries(def.inputs).map(([name, spec]: [string, any]) => ({ name, kind: spec.kind })),
         outputs: Object.entries(def.outputs).map(([name, spec]: [string, any]) => ({ name, kind: spec.kind })),
         constants: { ...inst.constants },
@@ -129,6 +176,16 @@ export function App() {
       const constants: Record<string, unknown> = {};
       for (const [name, spec] of Object.entries(def.inputs) as [string, any][]) {
         if (spec.default !== undefined) constants[name] = spec.default;
+      }
+      // Slider metadata defaults.
+      if (defId === 'core.slider') {
+        constants._min ??= 0;
+        constants._max ??= 10;
+        constants._step ??= 0.1;
+      }
+      // Expression default.
+      if (defId === 'math.expression') {
+        constants.expr ??= 'a';
       }
       const nodeId = graph.addNode(defId, constants);
       const pos = { ...nextPos.current };
@@ -191,15 +248,24 @@ export function App() {
       {/* Palette */}
       <div style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>Add Node</div>
-        {PALETTE.map((p) => (
-          <button
-            key={p.defId}
-            onClick={() => addNode(p.defId)}
-            style={{ background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '6px 10px', cursor: 'pointer', textAlign: 'left', fontSize: 12 }}
-          >
-            {p.label}
-          </button>
-        ))}
+        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {PALETTE.map((group) => (
+            <div key={group.label}>
+              <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#888', marginBottom: 4, letterSpacing: 1 }}>{group.label}</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                {group.entries.map((p) => (
+                  <button
+                    key={p.defId}
+                    onClick={() => addNode(p.defId)}
+                    style={{ background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Graph canvas */}

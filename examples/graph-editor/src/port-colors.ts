@@ -4,6 +4,7 @@ export const PORT_COLORS: Record<string, string> = {
   bool: '#ff4a6a',     // red
   vec3: '#4aff8b',     // green
   brep: '#ffa94a',     // orange
+  curve: '#d94aff',    // purple
   error: '#ff2222',    // bright red
 };
 

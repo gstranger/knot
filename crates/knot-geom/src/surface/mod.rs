@@ -4,6 +4,7 @@ pub mod sphere;
 pub mod cylinder;
 pub mod cone;
 pub mod torus;
+pub mod fit;
 
 use crate::point::{Point3, Vector3};
 
