@@ -9,7 +9,7 @@ import type { Brep, Curve } from '../kernel';
  * Adding a kind: extend this union AND `PortValueByKind`. The evaluator
  * and validation are kind-driven, so they pick up new kinds automatically.
  */
-export type PortKind = 'number' | 'bool' | 'vec3' | 'brep' | 'curve';
+export type PortKind = 'number' | 'bool' | 'vec3' | 'brep' | 'curve' | 'list';
 
 /** Maps port kind → unwrapped value type seen by node `evaluate`. */
 export interface PortValueByKind {
@@ -18,6 +18,7 @@ export interface PortValueByKind {
   vec3: Vec3;
   brep: Brep;
   curve: Curve;
+  list: unknown[];
 }
 
 /** Per-kind value port. Spelled out so TypeScript can narrow on `port.kind`. */

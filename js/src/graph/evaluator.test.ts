@@ -32,12 +32,20 @@ const Required = defineNode({
   evaluate: ({ x }) => ({ x }),
 });
 
+const RangeNode = defineNode({
+  id: 'test.range',
+  inputs: { count: { kind: 'number', default: 3 } },
+  outputs: { list: { kind: 'list' } },
+  evaluate: ({ count }) => ({ list: Array.from({ length: count }, (_, i) => i) }),
+});
+
 const buildRegistry = () => {
   const r = new Registry();
   r.register(Add);
   r.register(Mul);
   r.register(Boom);
   r.register(Required);
+  r.register(RangeNode);
   return r;
 };
 
@@ -124,5 +132,51 @@ describe('Evaluator', () => {
     g.removeNode(a);
     await ev.run(g);
     expect(ev.getOutput(a, 'sum')).toBeUndefined();
+  });
+
+  it('auto-iterates when a list feeds into a scalar input', async () => {
+    const g = new Graph(buildRegistry());
+    // Range → [0, 1, 2], feed into Add (a=list, b=10)
+    const range = g.addNode('test.range', { count: 3 });
+    const add = g.addNode('test.add', { b: 10 });
+    g.connect(range, 'list', add, 'a');
+    const ev = new Evaluator();
+    await ev.run(g);
+
+    const out = ev.getOutput(add, 'sum');
+    expect(out).toBeDefined();
+    expect(out!.kind).toBe('list');
+    expect(out!.value).toEqual([10, 11, 12]);
+  });
+
+  it('auto-iterates with longest-list matching', async () => {
+    const g = new Graph(buildRegistry());
+    const r3 = g.addNode('test.range', { count: 3 }); // [0, 1, 2]
+    const r2 = g.addNode('test.range', { count: 2 }); // [0, 1]
+    const add = g.addNode('test.add');
+    g.connect(r3, 'list', add, 'a');
+    g.connect(r2, 'list', add, 'b');
+    const ev = new Evaluator();
+    await ev.run(g);
+
+    const out = ev.getOutput(add, 'sum');
+    expect(out!.kind).toBe('list');
+    // longest list = 3; shorter wraps: [0,1,0]
+    expect(out!.value).toEqual([0, 2, 2]);
+  });
+
+  it('cascades auto-iteration through downstream nodes', async () => {
+    const g = new Graph(buildRegistry());
+    const range = g.addNode('test.range', { count: 3 }); // [0, 1, 2]
+    const add = g.addNode('test.add', { b: 1 });     // auto-iterate: [1, 2, 3]
+    const mul = g.addNode('test.mul', { b: 10 });     // auto-iterate: [10, 20, 30]
+    g.connect(range, 'list', add, 'a');
+    g.connect(add, 'sum', mul, 'a');
+    const ev = new Evaluator();
+    await ev.run(g);
+
+    const out = ev.getOutput(mul, 'product');
+    expect(out!.kind).toBe('list');
+    expect(out!.value).toEqual([10, 20, 30]);
   });
 });

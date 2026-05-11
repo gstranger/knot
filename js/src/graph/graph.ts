@@ -174,11 +174,12 @@ export class Graph {
   private assertKindsMatch(fromNode: NodeId, fromPort: PortName, toNode: NodeId, toPort: PortName): void {
     const fromKind = this.getDef(fromNode).outputs[fromPort].kind;
     const toKind = this.getDef(toNode).inputs[toPort].kind;
-    if (fromKind !== toKind) {
-      throw new Error(
-        `Graph: kind mismatch wiring ${fromNode}.${fromPort}:${fromKind} -> ${toNode}.${toPort}:${toKind}`
-      );
-    }
+    if (fromKind === toKind) return;
+    // list ↔ scalar: auto-iterate / auto-wrap handled by the evaluator.
+    if (fromKind === 'list' || toKind === 'list') return;
+    throw new Error(
+      `Graph: kind mismatch wiring ${fromNode}.${fromPort}:${fromKind} -> ${toNode}.${toPort}:${toKind}`
+    );
   }
 
   private detectCycle(): boolean {

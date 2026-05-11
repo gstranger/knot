@@ -17,12 +17,66 @@ import {
 import '@xyflow/react/dist/style.css';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
+import { Joyride, type Step, type EventData, STATUS } from 'react-joyride';
 
 import { createKnot, type Knot, type MeshData } from 'knot-cad';
 import { Graph, Evaluator, buildDefaultRegistry } from 'knot-cad/graph';
 import type { NodeRegistry } from 'knot-cad/graph';
 
 import { CadNode, type CadNodeData } from './CadNode';
+
+// ── Tour ────────────────────────────────────────────────────────
+const TOUR_STEPS: Step[] = [
+  {
+    target: 'body',
+    placement: 'center',
+    title: 'Welcome to the Knot Graph Editor',
+    content: 'This is a node-based parametric CAD tool. You build 3D geometry by connecting nodes in a visual graph \u2014 similar to Grasshopper or Geometry Nodes.',
+    skipBeacon: true,
+  },
+  {
+    target: '[data-tour="palette"]',
+    placement: 'right',
+    title: 'Node Palette',
+    content: 'This sidebar lists all available nodes, organized by category. Click any button to add that node to the graph canvas. Click a category header to expand or collapse it.',
+  },
+  {
+    target: '[data-tour="palette-primitives"]',
+    placement: 'right',
+    title: 'Primitives',
+    content: 'Start here. Box, Sphere, and Cylinder create solid 3D shapes that appear in the viewport.',
+  },
+  {
+    target: '[data-tour="palette-operations"]',
+    placement: 'right',
+    title: 'Operations',
+    content: 'Boolean (union / intersection / subtraction), Extrude, Revolve, Sweep, and Loft let you combine and transform shapes into complex geometry.',
+  },
+  {
+    target: '[data-tour="graph-canvas"]',
+    placement: 'left',
+    title: 'Graph Canvas',
+    content: 'Nodes you add appear here. Each node has colored input ports on the left and output ports on the right. Drag from an output to an input to connect them. The graph re-evaluates automatically.',
+  },
+  {
+    target: '[data-tour="graph-canvas"]',
+    placement: 'left',
+    title: 'Editing Tips',
+    content: 'Pan: drag the background. Zoom: scroll wheel. Select a node and press Backspace to delete it. Number inputs on nodes can be edited directly \u2014 just click and type.',
+  },
+  {
+    target: '[data-tour="viewport"]',
+    placement: 'left',
+    title: '3D Viewport',
+    content: 'The result of your graph renders here in real time. Drag to orbit, scroll to zoom. Every node that produces a solid shows up as blue geometry.',
+  },
+  {
+    target: 'body',
+    placement: 'center',
+    title: 'Try It: Subtract a Cylinder from a Box',
+    content: '1. Add a Box (Primitives \u203A Box)\n2. Add a Cylinder\n3. Add a Boolean (Operations \u203A Boolean)\n4. Connect the Box brep output \u2192 Boolean input "a"\n5. Connect the Cylinder brep output \u2192 Boolean input "b"\n6. Set Boolean "op" to 2 (subtraction)\n\nThe cylinder is cut from the box in the viewport!',
+  },
+];
 
 // ── Types ────────────────────────────────────────────────────────
 const nodeTypes: NodeTypes = { cad: CadNode as any };
@@ -82,6 +136,14 @@ const PALETTE: PaletteGroup[] = [
     { defId: 'core.curve.divide', label: 'Divide' },
     { defId: 'core.curve.offset', label: 'Offset' },
   ]},
+  { label: 'List', entries: [
+    { defId: 'list.range', label: 'Range' },
+    { defId: 'list.series', label: 'Series' },
+    { defId: 'list.item', label: 'List Item' },
+    { defId: 'list.length', label: 'List Length' },
+    { defId: 'list.repeat', label: 'Repeat' },
+    { defId: 'list.flatten', label: 'Flatten' },
+  ]},
 ];
 
 // ── App ──────────────────────────────────────────────────────────
@@ -128,8 +190,15 @@ export function App() {
       const def = graph.getDef(id);
       for (const port of Object.keys(def.outputs)) {
         const out = ev.getOutput(id, port);
-        if (out && out.kind === 'brep') {
+        if (!out) continue;
+        if (out.kind === 'brep') {
           try { newMeshes.push((out.value as any).tessellate()); } catch { /* skip */ }
+        } else if (out.kind === 'list' && Array.isArray(out.value)) {
+          for (const item of out.value as any[]) {
+            if (item && typeof item === 'object' && typeof item.tessellate === 'function') {
+              try { newMeshes.push(item.tessellate()); } catch { /* skip */ }
+            }
+          }
         }
       }
     }
@@ -249,20 +318,46 @@ export function App() {
     });
   }, []);
 
+  // Tour state
+  const [runTour, setRunTour] = useState(false);
+  const handleTourEvent = useCallback((data: EventData) => {
+    if (data.status === STATUS.FINISHED || data.status === STATUS.SKIPPED) {
+      setRunTour(false);
+    }
+  }, []);
+
   if (loading) {
     return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', width: '100vw' }}>Loading kernel…</div>;
   }
 
   return (
     <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+      <Joyride
+        steps={TOUR_STEPS}
+        run={runTour}
+        continuous
+        buttons={['back', 'primary', 'skip']}
+        onEvent={handleTourEvent}
+        primaryColor="#4a9eff"
+        backgroundColor="#2a2a3e"
+        textColor="#e0e0e0"
+        overlayColor="rgba(0, 0, 0, 0.7)"
+      />
       {/* Palette */}
-      <div style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>Add Node</div>
+      <div data-tour="palette" style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <span style={{ fontWeight: 700, fontSize: 14 }}>Add Node</span>
+          <button
+            onClick={() => setRunTour(true)}
+            style={{ background: '#2a2a3e', border: '1px solid #555', borderRadius: 4, color: '#888', padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
+            title="Take a guided tour"
+          >?</button>
+        </div>
         <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
           {PALETTE.map((group) => {
             const isOpen = openGroups.has(group.label);
             return (
-              <div key={group.label}>
+              <div key={group.label} data-tour={`palette-${group.label.toLowerCase()}`}>
                 <button
                   onClick={() => toggleGroup(group.label)}
                   style={{
@@ -295,7 +390,7 @@ export function App() {
       </div>
 
       {/* Graph canvas */}
-      <div style={{ flex: 1 }}>
+      <div data-tour="graph-canvas" style={{ flex: 1 }}>
         <ReactFlow
           nodes={rfNodes} edges={rfEdges}
           onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
@@ -312,7 +407,7 @@ export function App() {
       </div>
 
       {/* 3D viewport */}
-      <div style={{ width: 400, borderLeft: '1px solid #333' }}>
+      <div data-tour="viewport" style={{ width: 400, borderLeft: '1px solid #333' }}>
         <Canvas camera={{ position: [5, 5, 5], fov: 50 }}>
           <ambientLight intensity={0.4} />
           <directionalLight position={[5, 10, 5]} intensity={0.8} />

@@ -131,6 +131,16 @@ export class Evaluator {
           break;
         }
         if (upstream.kind !== spec.kind) {
+          // list → scalar: pass the array through; auto-iterate handles it later
+          if (upstream.kind === 'list' && spec.kind !== 'list') {
+            inputs[portName] = upstream.value;
+            continue;
+          }
+          // scalar → list: auto-wrap into 1-element array
+          if (upstream.kind !== 'list' && spec.kind === 'list') {
+            inputs[portName] = [upstream.value];
+            continue;
+          }
           inputError = errPort(
             `kind mismatch on ${id}.${portName}: expected ${spec.kind}, got ${upstream.kind}`,
             id,
@@ -154,10 +164,23 @@ export class Evaluator {
       newOutputs = poisonAll(def, inputError.kind === 'error' ? inputError.message : 'error', id);
     } else {
       const ctx: EvalContext = { nodeId: id, signal: this.opts.signal, constants: node.constants };
+
+      // Auto-iterate: detect list values wired into scalar inputs.
+      const listOnScalar: string[] = [];
+      for (const [portName, spec] of Object.entries(def.inputs)) {
+        if (spec.kind !== 'list' && Array.isArray(inputs[portName])) {
+          listOnScalar.push(portName);
+        }
+      }
+
       try {
         this.opts.onEvaluate?.(id, def.id);
-        const raw = await def.evaluate(inputs as never, ctx);
-        newOutputs = wrapOutputs(def, raw);
+        if (listOnScalar.length > 0) {
+          newOutputs = await this.autoIterate(def, inputs, listOnScalar, ctx, id);
+        } else {
+          const raw = await def.evaluate(inputs as never, ctx);
+          newOutputs = wrapOutputs(def, raw);
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         newOutputs = poisonAll(def, msg, id);
@@ -168,6 +191,47 @@ export class Evaluator {
     const prior = this.cache.get(id);
     if (prior) for (const p of Object.values(prior.outputs)) releasePortStorage(p);
     this.cache.set(id, { outputs: newOutputs });
+  }
+
+  /**
+   * Run a node once per list element (longest-list matching).
+   * Scalar inputs with list values iterate; other inputs stay constant.
+   * Each output port is collected into a list port.
+   */
+  private async autoIterate(
+    def: NodeDef<InputMap, OutputMap>,
+    inputs: Record<PortName, unknown>,
+    listOnScalar: string[],
+    ctx: EvalContext,
+    nodeId: NodeId,
+  ): Promise<Record<PortName, Port>> {
+    const maxLen = Math.max(
+      ...listOnScalar.map(p => (inputs[p] as unknown[]).length),
+    );
+    if (maxLen === 0) return poisonAll(def, 'empty list input', nodeId);
+
+    const collected: Record<PortName, unknown[]> = {};
+    for (const port of Object.keys(def.outputs)) collected[port] = [];
+
+    for (let i = 0; i < maxLen; i++) {
+      const iterInputs: Record<PortName, unknown> = { ...inputs };
+      for (const p of listOnScalar) {
+        const arr = inputs[p] as unknown[];
+        iterInputs[p] = arr[i % arr.length]; // wrap-around for shorter lists
+      }
+      const raw = await def.evaluate(iterInputs as never, ctx);
+      const r = raw as Record<string, unknown>;
+      for (const port of Object.keys(def.outputs)) {
+        collected[port].push(r[port]);
+      }
+    }
+
+    // Each output becomes a list port.
+    const out: Record<PortName, Port> = {};
+    for (const port of Object.keys(def.outputs)) {
+      out[port] = { kind: 'list', value: collected[port] } as Port;
+    }
+    return out;
   }
 }
 
@@ -201,7 +265,6 @@ function wrapValue<K extends PortKind>(kind: K, value: unknown): Port {
       if (typeof value !== 'boolean') throw new Error(`expected bool, got ${typeof value}`);
       return { kind: 'bool', value: value as PortValueByKind['bool'] };
     case 'vec3':
-      // Trust the node — vec3 is a plain {x,y,z}; runtime check would be cheap but noisy.
       return { kind: 'vec3', value: value as PortValueByKind['vec3'] };
     case 'brep':
       if (!(value instanceof Brep)) throw new Error('expected Brep instance');
@@ -209,6 +272,9 @@ function wrapValue<K extends PortKind>(kind: K, value: unknown): Port {
     case 'curve':
       if (!(value instanceof Curve)) throw new Error('expected Curve instance');
       return { kind: 'curve', value };
+    case 'list':
+      if (!Array.isArray(value)) throw new Error(`expected array, got ${typeof value}`);
+      return { kind: 'list', value } as Port;
     default:
       throw new Error(`unknown port kind '${kind}'`);
   }
@@ -217,4 +283,10 @@ function wrapValue<K extends PortKind>(kind: K, value: unknown): Port {
 function releasePortStorage(p: Port): void {
   if (p.kind === 'brep'  && p.value instanceof Brep)  p.value.free();
   if (p.kind === 'curve' && p.value instanceof Curve) p.value.free();
+  if (p.kind === 'list' && Array.isArray(p.value)) {
+    for (const item of p.value) {
+      if (item instanceof Brep) item.free();
+      if (item instanceof Curve) item.free();
+    }
+  }
 }

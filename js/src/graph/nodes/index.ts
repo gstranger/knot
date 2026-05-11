@@ -38,6 +38,12 @@ import { makeCylinderNode, makeExtrudeNode, makeRevolveNode } from './geometry';
 import { makeTriangleNode } from './profile';
 import { makeLoft2Node, makeLoft3Node } from './loft';
 
+// ── List ────────────────────────────────────────────────────────
+import {
+  RangeNode, SeriesNode, ListItemNode, ListLengthNode,
+  RepeatNode, FlattenNode,
+} from './list';
+
 // ── Re-exports ───────────────────────────────────────────────────
 export { NumberNode, Vec3Node, TranslateNode, ViewNode };
 export { SliderNode, ToggleNode, AddNode, SubtractNode, MultiplyNode, DivideNumNode, NegateNode, AbsNode, SinNode, CosNode, RemapNode, ExpressionNode };
@@ -48,6 +54,7 @@ export { makeCylinderNode, makeExtrudeNode, makeRevolveNode };
 export { makeLineNode, makeArcNode, makeSweepNode, PointAtNode, DivideNode, OffsetNode };
 export { makeTriangleNode };
 export { makeLoft2Node, makeLoft3Node };
+export { RangeNode, SeriesNode, ListItemNode, ListLengthNode, RepeatNode, FlattenNode };
 export type { ViewConstants } from './view';
 export type { BooleanOp } from './boolean';
 export { defineNode } from './define';
@@ -83,6 +90,8 @@ export function buildDefaultRegistry(knot: Knot): Registry {
     makeLineNode(knot), makeArcNode(knot),
     // Profile
     makeTriangleNode(knot),
+    // List
+    RangeNode, SeriesNode, ListItemNode, ListLengthNode, RepeatNode, FlattenNode,
   ];
   for (const d of defs) r.register(d);
   return r;

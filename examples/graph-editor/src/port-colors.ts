@@ -5,6 +5,7 @@ export const PORT_COLORS: Record<string, string> = {
   vec3: '#4aff8b',     // green
   brep: '#ffa94a',     // orange
   curve: '#d94aff',    // purple
+  list: '#ffdd4a',     // yellow
   error: '#ff2222',    // bright red
 };
 

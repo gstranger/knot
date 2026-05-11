@@ -13,6 +13,7 @@
     "knot-cad": "workspace:*",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
+    "react-joyride": "^3.1.0",
     "three": "^0.170.0"
   },
   "devDependencies": {
