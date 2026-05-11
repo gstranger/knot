@@ -82,11 +82,35 @@ impl Param {
 }
 
 /// A parsed STEP entity instance.
+///
+/// For complex entities (`#42 = ( TYPE_A(...) TYPE_B(...) ... )`) the
+/// "primary" sub-entity — the last one with non-empty params, matching the
+/// previous behaviour — lives in `name` / `params`, and every sibling
+/// sub-entity is recorded in `parts` so the reader can recover rational
+/// weights, knot data, and other facets that were previously lost.
 #[derive(Clone, Debug)]
 pub struct Entity {
     pub id: u64,
     pub name: String,
     pub params: Vec<Param>,
+    /// All sub-entities for a complex entity. Empty for simple ones.
+    /// Includes the primary too, so callers can iterate uniformly.
+    pub parts: Vec<EntityPart>,
+}
+
+/// One sub-entity inside a complex entity.
+#[derive(Clone, Debug)]
+pub struct EntityPart {
+    pub name: String,
+    pub params: Vec<Param>,
+}
+
+impl Entity {
+    /// Find a named sub-entity's params, if this is a complex entity that
+    /// has one. Returns the first match.
+    pub fn part(&self, name: &str) -> Option<&[Param]> {
+        self.parts.iter().find(|p| p.name == name).map(|p| p.params.as_slice())
+    }
 }
 
 /// Parsed STEP file: just the entity map from the DATA section.
@@ -160,8 +184,11 @@ pub fn parse_step(input: &str) -> Result<StepFile, String> {
 
         if bytes[pos] == b'(' {
             // Complex entity — multiple sub-entities sharing the same ID.
-            // Parse each sub-entity inside the outer parens.
+            // Parse each sub-entity inside the outer parens; keep all of them
+            // in `parts` so the reader can pull weights, knots, etc. out of
+            // sibling sub-entities (RATIONAL_B_SPLINE_CURVE, ...).
             pos += 1; // skip outer (
+            let mut parts: Vec<EntityPart> = Vec::new();
             while pos < bytes.len() && bytes[pos] != b')' {
                 skip_ws(bytes, &mut pos);
                 if pos >= bytes.len() || bytes[pos] == b')' { break; }
@@ -176,21 +203,31 @@ pub fn parse_step(input: &str) -> Result<StepFile, String> {
 
                 skip_ws(bytes, &mut pos);
                 if pos < bytes.len() && bytes[pos] == b'(' {
-                    // Has params — parse them
                     let sub_start = pos;
                     let sub_end = find_matching_paren(bytes, &mut pos);
                     let param_str = &data_section[sub_start..sub_end];
                     if let Ok(params) = parse_params(param_str) {
-                        // Register under the same ID — last one with params wins
-                        // for lookup purposes, but we register all names
-                        if !params.is_empty() || !entities.contains_key(&id) {
-                            entities.insert(id, Entity { id, name: sub_name, params });
-                        }
+                        parts.push(EntityPart { name: sub_name, params });
                     }
                 }
                 skip_ws(bytes, &mut pos);
             }
             if pos < bytes.len() { pos += 1; } // skip outer )
+
+            // Pick the "primary" sub-entity for legacy `entity.name` / `entity.params`
+            // lookups. Match the old behaviour: last sub-entity with non-empty
+            // params wins; if none have params, fall back to the last one.
+            let primary_idx = parts.iter().rposition(|p| !p.params.is_empty())
+                .or_else(|| if parts.is_empty() { None } else { Some(parts.len() - 1) });
+            if let Some(idx) = primary_idx {
+                let primary = parts[idx].clone();
+                entities.insert(id, Entity {
+                    id,
+                    name: primary.name,
+                    params: primary.params,
+                    parts,
+                });
+            }
         } else {
             // Simple entity
             let name_start = pos;
@@ -207,7 +244,7 @@ pub fn parse_step(input: &str) -> Result<StepFile, String> {
             let param_str = &data_section[params_start..end];
             let params = parse_params(param_str)?;
 
-            entities.insert(id, Entity { id, name, params });
+            entities.insert(id, Entity { id, name, params, parts: Vec::new() });
         }
 
         // Skip to semicolon
@@ -361,6 +398,35 @@ fn parse_one_param(input: &str, bytes: &[u8], pos: &mut usize) -> Result<Param, 
                 Ok(Param::Real(s.parse().map_err(|e| format!("bad real '{}': {}", s, e))?))
             } else {
                 Ok(Param::Int(s.parse().map_err(|e| format!("bad int '{}': {}", s, e))?))
+            }
+        }
+        c if c.is_ascii_alphabetic() => {
+            // Typed-value wrapper: NAME(...) — e.g. PARAMETER_VALUE(0.5),
+            // LENGTH_MEASURE(1.0), POSITIVE_LENGTH_MEASURE(2.0). STEP uses
+            // these to tag numeric values with units / semantics. For the
+            // reader we only care about the inner value, so we recurse
+            // into the parens and return that.
+            while *pos < bytes.len()
+                && (bytes[*pos].is_ascii_alphanumeric() || bytes[*pos] == b'_')
+            {
+                *pos += 1;
+            }
+            skip_ws(bytes, pos);
+            if *pos < bytes.len() && bytes[*pos] == b'(' {
+                *pos += 1;
+                skip_ws(bytes, pos);
+                if *pos < bytes.len() && bytes[*pos] == b')' {
+                    *pos += 1;
+                    return Ok(Param::Omitted);
+                }
+                let inner = parse_one_param(input, bytes, pos)?;
+                skip_ws(bytes, pos);
+                if *pos < bytes.len() && bytes[*pos] == b')' {
+                    *pos += 1;
+                }
+                Ok(inner)
+            } else {
+                Ok(Param::Omitted)
             }
         }
         _ => {

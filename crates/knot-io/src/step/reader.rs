@@ -45,6 +45,38 @@ use super::parser::{StepFile, Entity, Param};
 /// body — try the next one). If the file has no
 /// `MANIFOLD_SOLID_BREP` at all, scan
 /// `ADVANCED_BREP_SHAPE_REPRESENTATION` items for nested solids.
+/// Test-only entry point: read a single curve or surface by entity id from a
+/// raw STEP string. Lets entity-decoding tests assert against the resulting
+/// `Surface`/`Curve` variant directly, without building a full BRep around it.
+#[doc(hidden)]
+pub fn debug_read_surface(input: &str, id: u64) -> KResult<Surface> {
+    let step = super::parser::parse_step(input).map_err(|e| KernelError::Io {
+        detail: format!("STEP parse error: {}", e),
+    })?;
+    let ctx = ReadContext {
+        step: &step,
+        vertex_cache: RefCell::new(HashMap::new()),
+        edge_cache: RefCell::new(HashMap::new()),
+        surface_cache: RefCell::new(HashMap::new()),
+    };
+    ctx.read_surface(id)
+}
+
+/// Test-only entry point for curves. See `debug_read_surface`.
+#[doc(hidden)]
+pub fn debug_read_curve(input: &str, id: u64) -> KResult<Curve> {
+    let step = super::parser::parse_step(input).map_err(|e| KernelError::Io {
+        detail: format!("STEP parse error: {}", e),
+    })?;
+    let ctx = ReadContext {
+        step: &step,
+        vertex_cache: RefCell::new(HashMap::new()),
+        edge_cache: RefCell::new(HashMap::new()),
+        surface_cache: RefCell::new(HashMap::new()),
+    };
+    ctx.read_curve(id)
+}
+
 pub fn read_step(input: &str) -> KResult<BRep> {
     let step = super::parser::parse_step(input).map_err(|e| KernelError::Io {
         detail: format!("STEP parse error: {}", e),
@@ -497,6 +529,16 @@ impl<'a> ReadContext<'a> {
 
     fn read_curve(&self, id: u64) -> KResult<Curve> {
         let entity = self.get(id)?;
+        // Complex entities: the "primary" sub-entity recorded in `entity.name`
+        // is whichever one had non-empty params last. That can be a generic
+        // wrapper like REPRESENTATION_ITEM that has nothing to do with the
+        // geometry. If we see B-spline sub-entities, dispatch there.
+        if !entity.parts.is_empty()
+            && (entity.part("B_SPLINE_CURVE_WITH_KNOTS").is_some()
+                || entity.part("B_SPLINE_CURVE").is_some())
+        {
+            return self.read_bspline_curve(entity);
+        }
         match entity.name.as_str() {
             "LINE" => {
                 let pt_id = entity.params.get(1).and_then(|p| p.as_ref())
@@ -551,9 +593,11 @@ impl<'a> ReadContext<'a> {
                     end_angle: std::f64::consts::TAU,
                 }))
             }
-            "B_SPLINE_CURVE_WITH_KNOTS" => {
+            "B_SPLINE_CURVE_WITH_KNOTS" | "RATIONAL_B_SPLINE_CURVE" => {
                 self.read_bspline_curve(entity)
             }
+            "TRIMMED_CURVE" => self.read_trimmed_curve(entity),
+            "COMPOSITE_CURVE" => self.read_composite_curve(entity),
             "SEAM_CURVE" | "SURFACE_CURVE" | "INTERSECTION_CURVE" => {
                 // These are wrapper entities: ('name', #3d_curve, (#pcurve1, ...), .PCURVE_S1.)
                 // Extract the underlying 3D curve
@@ -572,27 +616,48 @@ impl<'a> ReadContext<'a> {
     }
 
     fn read_bspline_curve(&self, entity: &Entity) -> KResult<Curve> {
-        // B_SPLINE_CURVE_WITH_KNOTS('', degree, (#cp1, #cp2, ...), form, closed, self_int,
-        //                           (mult1, mult2, ...), (knot1, knot2, ...), knot_spec)
-        let degree = entity.params.get(1).and_then(|p| p.as_int())
-            .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing degree", entity.id) })? as u32;
+        // Two layouts to handle:
+        //
+        // 1. Simple entity B_SPLINE_CURVE_WITH_KNOTS(name, degree, cps, form,
+        //    closed, self_int, mults, knots, knot_spec).
+        // 2. Complex entity with siblings B_SPLINE_CURVE(degree, cps, form,
+        //    closed, self_int) and B_SPLINE_CURVE_WITH_KNOTS(mults, knots,
+        //    knot_spec) — the IS subtype split.
+        let is_complex = !entity.parts.is_empty();
 
-        let cp_refs = entity.params.get(2).and_then(|p| p.as_ref_list())
-            .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing control points", entity.id) })?;
-
-        let mults = entity.params.get(6).and_then(|p| p.as_list())
-            .map(|l| l.iter().filter_map(|p| p.as_int()).collect::<Vec<_>>())
-            .unwrap_or_default();
-
-        let knot_values = entity.params.get(7).and_then(|p| p.as_real_list())
-            .unwrap_or_default();
+        let (degree, cp_refs, mults, knot_values) = if is_complex {
+            let bsc_params = entity.part("B_SPLINE_CURVE").ok_or_else(|| KernelError::Io {
+                detail: format!("#{}: complex curve missing B_SPLINE_CURVE part", entity.id),
+            })?;
+            let bswk_params = entity.part("B_SPLINE_CURVE_WITH_KNOTS").ok_or_else(|| KernelError::Io {
+                detail: format!("#{}: complex curve missing B_SPLINE_CURVE_WITH_KNOTS part", entity.id),
+            })?;
+            let degree = bsc_params.get(0).and_then(|p| p.as_int())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing degree", entity.id) })? as u32;
+            let cps = bsc_params.get(1).and_then(|p| p.as_ref_list())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing control points", entity.id) })?;
+            let mults: Vec<i64> = bswk_params.get(0).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let knots = bswk_params.get(1).and_then(|p| p.as_real_list()).unwrap_or_default();
+            (degree, cps, mults, knots)
+        } else {
+            let degree = entity.params.get(1).and_then(|p| p.as_int())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing degree", entity.id) })? as u32;
+            let cps = entity.params.get(2).and_then(|p| p.as_ref_list())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing control points", entity.id) })?;
+            let mults: Vec<i64> = entity.params.get(6).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let knots = entity.params.get(7).and_then(|p| p.as_real_list()).unwrap_or_default();
+            (degree, cps, mults, knots)
+        };
 
         let mut control_points = Vec::new();
         for cp_id in &cp_refs {
             control_points.push(self.read_point(*cp_id)?);
         }
 
-        // Expand knots by multiplicities
         let mut knots = Vec::new();
         for (i, &mult) in mults.iter().enumerate() {
             let knot = knot_values.get(i).copied().unwrap_or(0.0);
@@ -601,7 +666,19 @@ impl<'a> ReadContext<'a> {
             }
         }
 
-        let weights = vec![1.0; control_points.len()]; // uniform weights for non-rational
+        // Pull rational weights from the sibling RATIONAL_B_SPLINE_CURVE if
+        // this is part of a complex entity; otherwise treat as non-rational.
+        let weights = self
+            .rational_weights(entity, "RATIONAL_B_SPLINE_CURVE")
+            .unwrap_or_else(|| vec![1.0; control_points.len()]);
+        if weights.len() != control_points.len() {
+            return Err(KernelError::Io {
+                detail: format!(
+                    "#{}: rational weight count {} != control point count {}",
+                    entity.id, weights.len(), control_points.len()
+                ),
+            });
+        }
 
         match NurbsCurve::new(control_points, weights, knots, degree) {
             Ok(c) => Ok(Curve::Nurbs(c)),
@@ -611,8 +688,225 @@ impl<'a> ReadContext<'a> {
         }
     }
 
+    /// TRIMMED_CURVE('name', #basis_curve, trim_1, trim_2, sense, trim_preference)
+    ///
+    /// The two trim parameters are lists that can contain a parametric value,
+    /// a point reference, or both. We honour parametric values when present
+    /// and either the basis curve has a meaningful angle domain (arc) or is
+    /// a line (then we clamp `t in [0,1]`). For NURBS we currently keep the
+    /// full curve — trimming a NURBS requires either knot-insertion or
+    /// re-parameterization, and silent approximation here would propagate
+    /// into the boolean's exact predicates.
+    fn read_trimmed_curve(&self, entity: &Entity) -> KResult<Curve> {
+        let basis_id = entity.params.get(1).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: TRIMMED_CURVE missing basis", entity.id) })?;
+        let basis = self.read_curve(basis_id)?;
+
+        let trim_a = trim_parameter(entity.params.get(2));
+        let trim_b = trim_parameter(entity.params.get(3));
+
+        match (basis, trim_a, trim_b) {
+            (Curve::Line(line), Some(a), Some(b)) => {
+                // STEP line trims are along the embedded VECTOR's magnitude
+                // direction. Without re-reading the original VECTOR magnitude
+                // we treat trim params as fractions along the line's [0,1]
+                // domain — close enough for the cases that show up in the
+                // wild, and we hard-fail by ignoring if the bounds are bad.
+                let lo = a.min(b).clamp(0.0, 1.0);
+                let hi = a.max(b).clamp(0.0, 1.0);
+                if hi <= lo + 1e-15 {
+                    return Err(KernelError::Io {
+                        detail: format!("#{}: TRIMMED_CURVE degenerate range", entity.id),
+                    });
+                }
+                let start = line.point_at(lo);
+                let end = line.point_at(hi);
+                Ok(Curve::Line(knot_geom::curve::LineSeg::new(start, end)))
+            }
+            (Curve::CircularArc(arc), Some(a), Some(b)) => {
+                let (lo, hi) = if b >= a { (a, b) } else { (a, b + std::f64::consts::TAU) };
+                Ok(Curve::CircularArc(CircularArc {
+                    center: arc.center,
+                    normal: arc.normal,
+                    radius: arc.radius,
+                    ref_direction: arc.ref_direction,
+                    start_angle: lo,
+                    end_angle: hi,
+                }))
+            }
+            (Curve::EllipticalArc(arc), Some(a), Some(b)) => {
+                use knot_geom::curve::EllipticalArc;
+                let (lo, hi) = if b >= a { (a, b) } else { (a, b + std::f64::consts::TAU) };
+                Ok(Curve::EllipticalArc(EllipticalArc {
+                    start_angle: lo,
+                    end_angle: hi,
+                    ..arc
+                }))
+            }
+            (other, _, _) => Ok(other),
+        }
+    }
+
+    /// COMPOSITE_CURVE('name', (#seg1, #seg2, ...), self_intersect)
+    /// where each #seg is a COMPOSITE_CURVE_SEGMENT('', .CONTINUOUS., .T., #parent).
+    ///
+    /// v1: returns the first segment's parent curve. Real composite-curve
+    /// support requires NURBS concatenation (a Track-C job); silently fitting
+    /// would inject approximation error into the exact-predicate topology.
+    fn read_composite_curve(&self, entity: &Entity) -> KResult<Curve> {
+        let segs = entity.params.get(1).and_then(|p| p.as_ref_list())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: COMPOSITE_CURVE missing segments", entity.id) })?;
+        let first_seg = segs.first().copied()
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: COMPOSITE_CURVE has no segments", entity.id) })?;
+        let seg = self.get(first_seg)?;
+        // COMPOSITE_CURVE_SEGMENT(transition, same_sense, parent_curve) — three
+        // params, parent is at index 2. (Some files put a name string at the
+        // front; tolerate either layout by scanning for the first Ref.)
+        let parent_id = seg.params.iter().find_map(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: COMPOSITE_CURVE_SEGMENT missing parent", first_seg) })?;
+        self.read_curve(parent_id)
+    }
+
+    /// SURFACE_OF_LINEAR_EXTRUSION('', #basis_curve, #direction_vector).
+    ///
+    /// Analytical specialisations:
+    ///   - LINE basis + any non-parallel direction → PLANE
+    ///   - CIRCLE basis + direction parallel to circle normal → CYLINDER
+    ///
+    /// Anything else returns `Err`; the caller falls back to the
+    /// placeholder plane (with origin anchored to the basis curve start).
+    fn read_linear_extrusion_surface(&self, entity: &Entity) -> KResult<Surface> {
+        let basis_id = entity.params.get(1).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: extrusion missing basis", entity.id) })?;
+        let vec_id = entity.params.get(2).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: extrusion missing direction", entity.id) })?;
+
+        let basis = self.read_curve(basis_id)?;
+        let direction = self.read_vector(vec_id)?;
+        let dir_n = direction.norm();
+        if dir_n < 1e-15 {
+            return Err(KernelError::Io { detail: format!("#{}: extrusion direction is zero", entity.id) });
+        }
+        let dir_unit = direction / dir_n;
+
+        match basis {
+            Curve::Line(line) => {
+                let line_dir = line.direction();
+                let ln = line_dir.norm();
+                if ln < 1e-15 {
+                    return Err(KernelError::Io { detail: format!("#{}: zero-length basis line", entity.id) });
+                }
+                let line_unit = line_dir / ln;
+                let cross = line_unit.cross(&dir_unit);
+                let cn = cross.norm();
+                if cn < 1e-9 {
+                    return Err(KernelError::Io {
+                        detail: format!("#{}: extrusion direction parallel to basis line", entity.id),
+                    });
+                }
+                Ok(Surface::Plane(Plane::new(line.start, cross / cn)))
+            }
+            Curve::CircularArc(arc) => {
+                let an = arc.normal.norm();
+                if an < 1e-15 {
+                    return Err(KernelError::Io { detail: format!("#{}: arc normal is zero", entity.id) });
+                }
+                let arc_normal_unit = arc.normal / an;
+                if (arc_normal_unit.dot(&dir_unit).abs() - 1.0).abs() > 1e-6 {
+                    return Err(KernelError::Io {
+                        detail: format!("#{}: arc extrude direction not parallel to arc normal — not a cylinder", entity.id),
+                    });
+                }
+                Ok(Surface::Cylinder(Cylinder {
+                    origin: arc.center,
+                    axis: dir_unit,
+                    radius: arc.radius,
+                    ref_direction: arc.ref_direction,
+                    v_min: -1e6,
+                    v_max: 1e6,
+                }))
+            }
+            _ => Err(KernelError::Io {
+                detail: format!("#{}: extrusion of non-line/non-arc basis not yet specialised", entity.id),
+            }),
+        }
+    }
+
+    /// SURFACE_OF_REVOLUTION('', #basis_curve, #axis1_placement).
+    ///
+    /// Analytical specialisations:
+    ///   - LINE parallel to axis → CYLINDER (radius = perpendicular dist)
+    ///   - LINE meeting axis at an angle → CONE (apex at intersection)
+    ///   - CIRCLE whose plane contains the axis, centre on axis → SPHERE
+    ///   - CIRCLE whose plane contains the axis, centre off axis → TORUS
+    fn read_revolution_surface(&self, entity: &Entity) -> KResult<Surface> {
+        let basis_id = entity.params.get(1).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: revolution missing basis", entity.id) })?;
+        let axis_id = entity.params.get(2).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: revolution missing axis", entity.id) })?;
+
+        let basis = self.read_curve(basis_id)?;
+        // axis1_placement is the AXIS1_PLACEMENT (location + axis) variant.
+        // Read it via the same helper as AXIS2_PLACEMENT — the third
+        // component (ref_direction) gets a synthetic perpendicular.
+        let (origin, axis, _) = self.read_axis2_placement(axis_id)?;
+        let axn = axis.norm();
+        if axn < 1e-15 {
+            return Err(KernelError::Io { detail: format!("#{}: revolution axis is zero", entity.id) });
+        }
+        let axis_unit = axis / axn;
+
+        match basis {
+            Curve::Line(line) => revolve_line(&line, origin, axis_unit, entity.id),
+            Curve::CircularArc(arc) => revolve_circle(&arc, origin, axis_unit, entity.id),
+            _ => Err(KernelError::Io {
+                detail: format!("#{}: revolution of non-line/non-arc basis not yet specialised", entity.id),
+            }),
+        }
+    }
+
+    fn read_vector(&self, vec_id: u64) -> KResult<Vector3> {
+        let v = self.get(vec_id)?;
+        let dir_id = v.params.get(1).and_then(|p| p.as_ref())
+            .ok_or_else(|| KernelError::Io { detail: format!("#{}: VECTOR missing direction", vec_id) })?;
+        let mag = v.params.get(2).and_then(|p| p.as_real()).unwrap_or(1.0);
+        let dir = self.read_direction(dir_id)?;
+        Ok(dir * mag)
+    }
+
+    /// Look up weights from a RATIONAL_B_SPLINE_{CURVE,SURFACE} sibling.
+    ///
+    /// The rational sub-entity's single parameter is the weight list.
+    /// For surfaces it's a list-of-lists (one row per u-index); we flatten
+    /// to match `control_points` storage order (row-major over u, then v).
+    fn rational_weights(&self, entity: &Entity, sibling: &str) -> Option<Vec<f64>> {
+        let part = entity.part(sibling)?;
+        let raw = part.get(0)?;
+        // Surface case: list of lists.
+        if let Some(list) = raw.as_list() {
+            let nested = list.iter().any(|p| p.as_list().is_some());
+            if nested {
+                let mut out = Vec::new();
+                for row in list {
+                    if let Some(row_vals) = row.as_real_list() {
+                        out.extend(row_vals);
+                    }
+                }
+                return Some(out);
+            }
+            return raw.as_real_list();
+        }
+        None
+    }
+
     fn read_surface(&self, id: u64) -> KResult<Surface> {
         let entity = self.get(id)?;
+        if !entity.parts.is_empty()
+            && (entity.part("B_SPLINE_SURFACE_WITH_KNOTS").is_some()
+                || entity.part("B_SPLINE_SURFACE").is_some())
+        {
+            return self.read_bspline_surface(entity);
+        }
         match entity.name.as_str() {
             "PLANE" => {
                 let axis_id = entity.params.get(1).and_then(|p| p.as_ref())
@@ -685,41 +979,87 @@ impl<'a> ReadContext<'a> {
                     ref_direction: ref_dir,
                 }))
             }
-            "B_SPLINE_SURFACE_WITH_KNOTS" => {
+            "B_SPLINE_SURFACE_WITH_KNOTS" | "RATIONAL_B_SPLINE_SURFACE" => {
                 self.read_bspline_surface(entity)
             }
-            // Unsupported surface types: use a placeholder plane.
-            // The face topology (vertices, edges, loops) is imported correctly;
-            // the surface geometry is approximated. This preserves import success
-            // rate while deferring proper swept/offset surface representation.
-            //
-            // TODO: Implement SURFACE_OF_REVOLUTION, SURFACE_OF_LINEAR_EXTRUSION,
-            // OFFSET_SURFACE as proper surface types or NURBS conversions.
-            "SURFACE_OF_LINEAR_EXTRUSION" | "SURFACE_OF_REVOLUTION" | "OFFSET_SURFACE" | _ => {
-                // Construct a plane from the first face that references this surface.
-                // The caller (read_face) will provide vertex positions via the edge loop.
-                // We return a z-plane as a placeholder; the actual face shape is carried
-                // by the boundary polygon.
-                Ok(Surface::Plane(Plane::new(Point3::origin(), Vector3::z())))
+            "SURFACE_OF_LINEAR_EXTRUSION" => {
+                self.read_linear_extrusion_surface(entity)
+                    .or_else(|_| Ok(self.placeholder_surface(entity)))
+            }
+            "SURFACE_OF_REVOLUTION" => {
+                self.read_revolution_surface(entity)
+                    .or_else(|_| Ok(self.placeholder_surface(entity)))
+            }
+            _ => {
+                // Unsupported surface types (OFFSET_SURFACE, others) still
+                // produce a placeholder so the face topology can land. The
+                // boundary polygon carries the face's actual shape.
+                Ok(self.placeholder_surface(entity))
             }
         }
     }
 
-    fn read_bspline_surface(&self, entity: &Entity) -> KResult<Surface> {
-        // B_SPLINE_SURFACE_WITH_KNOTS('', u_deg, v_deg, ((#cp,...), ...), form,
-        //   u_closed, v_closed, self_int, (u_mults), (v_mults), (u_knots), (v_knots), knot_spec)
-        let u_degree = entity.params.get(1).and_then(|p| p.as_int()).unwrap_or(1) as u32;
-        let v_degree = entity.params.get(2).and_then(|p| p.as_int()).unwrap_or(1) as u32;
+    /// Anchor the placeholder plane on something better than the global
+    /// origin so face polygons don't all collapse to z=0 visually. We use
+    /// the first control / endpoint we can find on the basis curve.
+    fn placeholder_surface(&self, entity: &Entity) -> Surface {
+        let basis_point = entity
+            .params
+            .get(1)
+            .and_then(|p| p.as_ref())
+            .and_then(|id| self.read_curve(id).ok())
+            .map(|c| c.point_at(knot_geom::curve::CurveParam(c.domain().start)))
+            .unwrap_or(Point3::origin());
+        Surface::Plane(Plane::new(basis_point, Vector3::z()))
+    }
 
-        // Control points: nested list of lists of refs
-        let cp_rows = entity.params.get(3).and_then(|p| p.as_list())
-            .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing CPs", entity.id) })?;
+    fn read_bspline_surface(&self, entity: &Entity) -> KResult<Surface> {
+        // Like the curve reader: simple entity puts everything in params with
+        // a leading name; complex entities split between B_SPLINE_SURFACE
+        // (degrees + cps) and B_SPLINE_SURFACE_WITH_KNOTS (mults + knots).
+        let is_complex = !entity.parts.is_empty();
+
+        let (u_degree, v_degree, cp_rows, u_mults, v_mults, u_knot_vals, v_knot_vals) = if is_complex {
+            let bss = entity.part("B_SPLINE_SURFACE").ok_or_else(|| KernelError::Io {
+                detail: format!("#{}: complex surface missing B_SPLINE_SURFACE part", entity.id),
+            })?;
+            let bswk = entity.part("B_SPLINE_SURFACE_WITH_KNOTS").ok_or_else(|| KernelError::Io {
+                detail: format!("#{}: complex surface missing B_SPLINE_SURFACE_WITH_KNOTS part", entity.id),
+            })?;
+            let u_deg = bss.get(0).and_then(|p| p.as_int()).unwrap_or(1) as u32;
+            let v_deg = bss.get(1).and_then(|p| p.as_int()).unwrap_or(1) as u32;
+            let rows = bss.get(2).and_then(|p| p.as_list())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing CPs", entity.id) })?;
+            let u_m: Vec<i64> = bswk.get(0).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let v_m: Vec<i64> = bswk.get(1).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let u_kv = bswk.get(2).and_then(|p| p.as_real_list()).unwrap_or_default();
+            let v_kv = bswk.get(3).and_then(|p| p.as_real_list()).unwrap_or_default();
+            (u_deg, v_deg, rows.to_vec(), u_m, v_m, u_kv, v_kv)
+        } else {
+            let u_deg = entity.params.get(1).and_then(|p| p.as_int()).unwrap_or(1) as u32;
+            let v_deg = entity.params.get(2).and_then(|p| p.as_int()).unwrap_or(1) as u32;
+            let rows = entity.params.get(3).and_then(|p| p.as_list())
+                .ok_or_else(|| KernelError::Io { detail: format!("#{}: missing CPs", entity.id) })?;
+            let u_m: Vec<i64> = entity.params.get(8).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let v_m: Vec<i64> = entity.params.get(9).and_then(|p| p.as_list())
+                .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
+                .unwrap_or_default();
+            let u_kv = entity.params.get(10).and_then(|p| p.as_real_list()).unwrap_or_default();
+            let v_kv = entity.params.get(11).and_then(|p| p.as_real_list()).unwrap_or_default();
+            (u_deg, v_deg, rows.to_vec(), u_m, v_m, u_kv, v_kv)
+        };
 
         let mut control_points = Vec::new();
         let mut count_u = 0u32;
         let mut count_v = 0u32;
 
-        for row in cp_rows {
+        for row in &cp_rows {
             let row_refs = row.as_ref_list().unwrap_or_default();
             if count_u == 0 {
                 count_v = row_refs.len() as u32;
@@ -729,16 +1069,6 @@ impl<'a> ReadContext<'a> {
                 control_points.push(self.read_point(cp_id)?);
             }
         }
-
-        // Knot multiplicities and values
-        let u_mults: Vec<i64> = entity.params.get(8).and_then(|p| p.as_list())
-            .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
-            .unwrap_or_default();
-        let v_mults: Vec<i64> = entity.params.get(9).and_then(|p| p.as_list())
-            .map(|l| l.iter().filter_map(|p| p.as_int()).collect())
-            .unwrap_or_default();
-        let u_knot_vals = entity.params.get(10).and_then(|p| p.as_real_list()).unwrap_or_default();
-        let v_knot_vals = entity.params.get(11).and_then(|p| p.as_real_list()).unwrap_or_default();
 
         let mut knots_u = Vec::new();
         for (i, &m) in u_mults.iter().enumerate() {
@@ -752,7 +1082,17 @@ impl<'a> ReadContext<'a> {
             for _ in 0..m { knots_v.push(k); }
         }
 
-        let weights = vec![1.0; control_points.len()];
+        let weights = self
+            .rational_weights(entity, "RATIONAL_B_SPLINE_SURFACE")
+            .unwrap_or_else(|| vec![1.0; control_points.len()]);
+        if weights.len() != control_points.len() {
+            return Err(KernelError::Io {
+                detail: format!(
+                    "#{}: rational weight count {} != control point count {}",
+                    entity.id, weights.len(), control_points.len()
+                ),
+            });
+        }
 
         match NurbsSurface::new(control_points, weights, knots_u, knots_v, u_degree, v_degree, count_u, count_v) {
             Ok(s) => Ok(Surface::Nurbs(s)),
@@ -761,6 +1101,157 @@ impl<'a> ReadContext<'a> {
             }),
         }
     }
+}
+
+/// Pull a numeric parameter out of a STEP trim list. Trim lists look like
+/// `(PARAMETER_VALUE(0.5))` or `(PARAMETER_VALUE(0.5), #123)`, where the
+/// `#123` is a CARTESIAN_POINT alternative. We honour the first
+/// numerical value we can find; point-form trims are not yet decoded.
+fn trim_parameter(param: Option<&Param>) -> Option<f64> {
+    let list = param?.as_list()?;
+    list.iter().find_map(|p| p.as_real())
+}
+
+/// Revolve a line around an axis. Returns CYLINDER for axis-parallel
+/// lines, CONE for lines that meet the axis.
+fn revolve_line(line: &LineSeg, axis_origin: Point3, axis_unit: Vector3, id: u64) -> KResult<Surface> {
+    let line_dir = line.direction();
+    let ln = line_dir.norm();
+    if ln < 1e-15 {
+        return Err(KernelError::Io { detail: format!("#{}: revolution line is zero-length", id) });
+    }
+    let line_unit = line_dir / ln;
+    let parallel = (line_unit.dot(&axis_unit).abs() - 1.0).abs() < 1e-9;
+
+    // Radius at the line's start: perpendicular distance to the axis.
+    let rel = line.start - axis_origin;
+    let radial = rel - axis_unit * rel.dot(&axis_unit);
+    let r_start = radial.norm();
+
+    if parallel {
+        if r_start < 1e-12 {
+            // Line on the axis: degenerates to the axis itself.
+            return Err(KernelError::Io {
+                detail: format!("#{}: revolution line lies on axis (no surface)", id),
+            });
+        }
+        let ref_dir = radial / r_start;
+        return Ok(Surface::Cylinder(Cylinder {
+            origin: axis_origin + axis_unit * rel.dot(&axis_unit),
+            axis: axis_unit,
+            radius: r_start,
+            ref_direction: ref_dir,
+            v_min: -1e6,
+            v_max: 1e6,
+        }));
+    }
+
+    // For a cone, the line must intersect the axis at a single apex.
+    // Solve start + t*line_unit = axis_origin + s*axis_unit for some t, s,
+    // such that the residual (perpendicular component) vanishes.
+    // The 3D system is overdetermined; the standard approach is the
+    // line-line closest-point computation followed by a coincidence check.
+    let w = line.start - axis_origin;
+    let a = 1.0;
+    let b = line_unit.dot(&axis_unit);
+    let c = 1.0;
+    let d = line_unit.dot(&w);
+    let e = axis_unit.dot(&w);
+    let denom = a * c - b * b;
+    if denom.abs() < 1e-15 {
+        return Err(KernelError::Io { detail: format!("#{}: revolution line nearly parallel to axis", id) });
+    }
+    let t = (b * e - c * d) / denom;
+    let s = (a * e - b * d) / denom;
+    let p_on_line = line.start + line_unit * t;
+    let p_on_axis = axis_origin + axis_unit * s;
+    if (p_on_line - p_on_axis).norm() > 1e-6 {
+        return Err(KernelError::Io {
+            detail: format!("#{}: revolution line and axis are skew — not a cone", id),
+        });
+    }
+    let apex = p_on_axis;
+
+    // Half-angle = angle between line direction and axis, in [0, π/2].
+    let cos_a = line_unit.dot(&axis_unit).abs();
+    let half_angle = cos_a.clamp(-1.0, 1.0).acos();
+    if half_angle < 1e-6 || (half_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6 {
+        return Err(KernelError::Io {
+            detail: format!("#{}: revolution produces degenerate cone", id),
+        });
+    }
+
+    // ref_direction = unit vector in the plane perpendicular to the axis
+    // pointing toward where the line emerges from the apex. The line might
+    // *start* at the apex (radial component = 0 there) — sample some other
+    // point on the line for a non-degenerate radial component.
+    let pick_radial = |t: f64| -> Vector3 {
+        let p = line.point_at(t);
+        let along = axis_unit * (p - apex).dot(&axis_unit);
+        (p - apex) - along
+    };
+    let mut radial_v = pick_radial(1.0);
+    if radial_v.norm() < 1e-12 {
+        radial_v = pick_radial(0.5);
+    }
+    if radial_v.norm() < 1e-12 {
+        radial_v = pick_radial(0.0);
+    }
+    let rn = radial_v.norm();
+    if rn < 1e-12 {
+        return Err(KernelError::Io {
+            detail: format!("#{}: cannot determine cone ref_direction", id),
+        });
+    }
+    let ref_direction = radial_v / rn;
+
+    Ok(Surface::Cone(Cone {
+        apex,
+        axis: if line.start.coords.dot(&axis_unit) >= apex.coords.dot(&axis_unit) { axis_unit } else { -axis_unit },
+        half_angle,
+        ref_direction,
+        v_min: 1e-3,
+        v_max: 1e6,
+    }))
+}
+
+/// Revolve a circle around an axis. The circle's plane must contain the
+/// axis (i.e. `circle.normal ⊥ axis`). If the circle centre lies on the
+/// axis we get a sphere; otherwise a torus.
+fn revolve_circle(arc: &CircularArc, axis_origin: Point3, axis_unit: Vector3, id: u64) -> KResult<Surface> {
+    let an = arc.normal.norm();
+    if an < 1e-15 {
+        return Err(KernelError::Io { detail: format!("#{}: arc normal is zero", id) });
+    }
+    let arc_normal_unit = arc.normal / an;
+
+    // Plane-contains-axis test: arc normal must be perpendicular to axis.
+    if arc_normal_unit.dot(&axis_unit).abs() > 1e-6 {
+        return Err(KernelError::Io {
+            detail: format!("#{}: arc plane does not contain revolution axis — not sphere/torus", id),
+        });
+    }
+
+    // Distance from circle centre to axis line.
+    let rel = arc.center - axis_origin;
+    let along = axis_unit * rel.dot(&axis_unit);
+    let radial = rel - along;
+    let centre_to_axis = radial.norm();
+
+    if centre_to_axis < 1e-9 {
+        // Sphere case.
+        return Ok(Surface::Sphere(Sphere::new(arc.center, arc.radius)));
+    }
+
+    // Torus case.
+    let ref_direction = radial / centre_to_axis;
+    Ok(Surface::Torus(Torus {
+        center: axis_origin + along,
+        axis: axis_unit,
+        major_radius: centre_to_axis,
+        minor_radius: arc.radius,
+        ref_direction,
+    }))
 }
 
 /// Reconcile a STEP edge's curve with its vertex endpoints. STEP
