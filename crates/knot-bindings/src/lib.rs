@@ -81,6 +81,52 @@ pub fn create_line(
     }
 }
 
+/// Interpolate a NURBS curve exactly through the given points.
+///
+/// Uses chord-length parameterization and the averaging-knots
+/// construction (Piegl & Tiller §9.2). The result is a non-rational
+/// B-spline (all weights = 1) of the requested degree.
+///
+/// `points` is a flat `[x, y, z, x, y, z, …]` buffer. Requires at
+/// least `degree + 1` points.
+#[wasm_bindgen]
+pub fn interpolate_curve(points: &[f64], degree: u32) -> Result<JsCurve, JsError> {
+    if points.len() % 3 != 0 {
+        return Err(JsError::new("points length must be a multiple of 3"));
+    }
+    let pts: Vec<Point3> = points
+        .chunks_exact(3)
+        .map(|c| Point3::new(c[0], c[1], c[2]))
+        .collect();
+    let nurbs = knot_geom::curve::fit::interpolate_curve(&pts, degree)
+        .map_err(kernel_err_to_js)?;
+    Ok(JsCurve { inner: knot_geom::curve::Curve::Nurbs(nurbs) })
+}
+
+/// Least-squares NURBS curve approximation.
+///
+/// Passes exactly through the first and last data points; interior
+/// points are fit in a least-squares sense. `num_control_points`
+/// must satisfy `degree + 1 ≤ num_cp ≤ points.len()`. When
+/// `num_cp == points.len()` this delegates to exact interpolation.
+#[wasm_bindgen]
+pub fn approximate_curve(
+    points: &[f64],
+    num_control_points: u32,
+    degree: u32,
+) -> Result<JsCurve, JsError> {
+    if points.len() % 3 != 0 {
+        return Err(JsError::new("points length must be a multiple of 3"));
+    }
+    let pts: Vec<Point3> = points
+        .chunks_exact(3)
+        .map(|c| Point3::new(c[0], c[1], c[2]))
+        .collect();
+    let nurbs = knot_geom::curve::fit::approximate_curve(&pts, num_control_points as usize, degree)
+        .map_err(kernel_err_to_js)?;
+    Ok(JsCurve { inner: knot_geom::curve::Curve::Nurbs(nurbs) })
+}
+
 /// Create a circular arc curve.
 ///
 /// - `cx,cy,cz`: centre

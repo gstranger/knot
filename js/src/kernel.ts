@@ -488,6 +488,25 @@ export interface Knot {
   /** Create a NURBS curve from control points, weights, knot vector, and degree. */
   nurbsCurve(opts: NurbsCurveOptions): Curve;
 
+  /**
+   * Interpolate a NURBS curve exactly through the given points.
+   *
+   * Uses chord-length parameterization and the averaging-knots
+   * construction (Piegl & Tiller §9.2). Result is a non-rational
+   * B-spline of the requested degree. Requires at least
+   * `degree + 1` points.
+   */
+  interpolateCurve(points: Vec3[], degree?: number): Curve;
+
+  /**
+   * Least-squares NURBS curve approximation. Passes exactly through
+   * the first and last points; interior points are fit in a
+   * least-squares sense. `numControlPoints` must satisfy
+   * `degree + 1 ≤ num_cp ≤ points.length`. When `num_cp` equals
+   * `points.length` this collapses to exact interpolation.
+   */
+  approximateCurve(points: Vec3[], numControlPoints: number, degree?: number): Curve;
+
   /** Sweep a planar profile BRep along a curve rail to create a solid. */
   sweep(profile: Brep, rail: Curve): Brep;
 
@@ -581,6 +600,16 @@ export async function createKnot(wasmPath?: InitInput): Promise<Knot> {
           throw new Error('nurbsCurve: weights length must match controlPoints length');
         }
         return new Curve(mod.create_nurbs_curve(cp, w, new Float64Array(knots), degree));
+      },
+
+      interpolateCurve: (points, degree = 3) => {
+        const flat = new Float64Array(points.flatMap(p => [p.x, p.y, p.z]));
+        return new Curve(mod.interpolate_curve(flat, degree));
+      },
+
+      approximateCurve: (points, numControlPoints, degree = 3) => {
+        const flat = new Float64Array(points.flatMap(p => [p.x, p.y, p.z]));
+        return new Curve(mod.approximate_curve(flat, numControlPoints, degree));
       },
 
       sweep: (profile, rail) => new Brep(mod.sweep(profile._raw, rail._raw)),
