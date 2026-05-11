@@ -76,6 +76,95 @@ fn box_export_has_no_circles() {
 }
 
 #[test]
+fn oblique_plane_cylinder_edge_becomes_ellipse() {
+    // Construct a synthetic 2-face shell where one face uses a
+    // Cylinder surface (axis = +z, radius = 1) and the other uses a
+    // Plane surface tilted at 45° to the z-axis. The two faces share
+    // an edge whose endpoints lie on the intersection ellipse:
+    //
+    //   Cylinder: axis = z, origin = (0,0,0), radius = 1
+    //   Plane:    normal = (0, 1/√2, 1/√2), passes through origin
+    //   Intersection: ellipse with minor=1, major=√2 (since |a·n|=1/√2),
+    //                 center at origin, major_dir = (0, -1/√2, 1/√2)
+    //
+    // Point at major axis +1·major: (0, -1, 1).
+    // Point at minor axis +1·minor: (1, 0, 0).
+    // Both satisfy x²+y²=1 (on cylinder) and y/√2 + z/√2 = 0 (on plane).
+    use std::sync::Arc;
+    use knot_geom::curve::{Curve, LineSeg};
+    use knot_geom::surface::{Cylinder, Plane, Surface};
+    use knot_geom::{Point3, Vector3};
+    use knot_topo::*;
+
+    let p_on_ellipse_a = Point3::new(1.0, 0.0, 0.0);
+    let p_on_ellipse_b = Point3::new(0.0, -1.0, 1.0);
+    // A third point — also on the cylinder AND on the plane — to
+    // close the loop into a triangle on each face.
+    let p_on_ellipse_c = Point3::new(-1.0, 0.0, 0.0);
+
+    let v_a = Arc::new(Vertex::new(p_on_ellipse_a));
+    let v_b = Arc::new(Vertex::new(p_on_ellipse_b));
+    let v_c = Arc::new(Vertex::new(p_on_ellipse_c));
+
+    let make_edge = |va: &Arc<Vertex>, vb: &Arc<Vertex>| -> HalfEdge {
+        let curve = Arc::new(Curve::Line(LineSeg::new(*va.point(), *vb.point())));
+        let edge = Arc::new(Edge::new(va.clone(), vb.clone(), curve, 0.0, 1.0));
+        HalfEdge::new(edge, true)
+    };
+
+    let cyl_loop = Loop::new(
+        vec![
+            make_edge(&v_a, &v_b),
+            make_edge(&v_b, &v_c),
+            make_edge(&v_c, &v_a),
+        ],
+        true,
+    )
+    .unwrap();
+    let plane_loop = Loop::new(
+        vec![
+            make_edge(&v_a, &v_b),
+            make_edge(&v_b, &v_c),
+            make_edge(&v_c, &v_a),
+        ],
+        true,
+    )
+    .unwrap();
+
+    let cyl_surface = Arc::new(Surface::Cylinder(Cylinder {
+        origin: Point3::origin(),
+        axis: Vector3::z(),
+        radius: 1.0,
+        ref_direction: Vector3::x(),
+        v_min: -2.0,
+        v_max: 2.0,
+    }));
+    let inv_sqrt2 = 1.0 / 2.0_f64.sqrt();
+    let plane_surface = Arc::new(Surface::Plane(Plane::new(
+        Point3::origin(),
+        Vector3::new(0.0, inv_sqrt2, inv_sqrt2),
+    )));
+
+    let cyl_face = Face::new(cyl_surface, cyl_loop, vec![], true).unwrap();
+    let plane_face = Face::new(plane_surface, plane_loop, vec![], true).unwrap();
+    let shell = Shell::new(vec![cyl_face, plane_face], false).unwrap();
+    let solid = Solid::new(shell, vec![]).unwrap();
+    let brep = BRep::new(vec![solid]).unwrap();
+
+    let step = knot_io::to_step(&brep).unwrap();
+    let n_ellipse = count_entities(&step, "ELLIPSE");
+    let n_circle = count_entities(&step, "CIRCLE");
+
+    assert!(
+        n_ellipse >= 3,
+        "expected ≥3 ELLIPSE entities (one per shared edge), got {}",
+        n_ellipse,
+    );
+    // The plane is not perpendicular, so no CIRCLE upgrade should fire.
+    assert_eq!(n_circle, 0, "oblique cut should not produce CIRCLE entities");
+}
+
+#[test]
 fn cylinder_export_roundtrips_through_parser() {
     // The upgraded export must still parse correctly — we depend on
     // the parser handling CIRCLE in EDGE_CURVE positions.

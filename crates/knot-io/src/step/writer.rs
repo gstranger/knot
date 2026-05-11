@@ -10,7 +10,7 @@ use std::sync::Arc;
 use knot_core::{KResult, KernelError};
 use knot_geom::Point3;
 use knot_geom::Vector3;
-use knot_geom::curve::{Curve, CircularArc};
+use knot_geom::curve::{Curve, CircularArc, EllipticalArc};
 use knot_geom::surface::{Surface, Plane, Cylinder, Sphere};
 use knot_topo::*;
 
@@ -507,13 +507,13 @@ fn upgrade_curve_for_export(
     for i in 0..surfaces.len() {
         for j in 0..surfaces.len() {
             if i == j { continue; }
-            if let Some(arc) = recognize_arc(
+            if let Some(c) = recognize_curve_form(
                 surfaces[i].as_ref(),
                 surfaces[j].as_ref(),
                 start,
                 end,
             ) {
-                return Curve::CircularArc(arc);
+                return c;
             }
         }
     }
@@ -521,49 +521,87 @@ fn upgrade_curve_for_export(
 }
 
 /// Match the ordered surface pair against known analytical
-/// intersection forms (plane∩cylinder, plane∩sphere). Returns a
-/// circular arc whose underlying full circle is the intersection
-/// circle and whose start/end angles are derived from the line
-/// endpoints. Returns `None` when the configuration isn't one of
-/// the recognized cases or when the line endpoints don't lie on
-/// the proposed circle within tolerance.
-fn recognize_arc(s_a: &Surface, s_b: &Surface, start: &Point3, end: &Point3) -> Option<CircularArc> {
+/// intersection forms (plane∩cylinder = circle or ellipse,
+/// plane∩sphere = circle). Returns the analytical curve when the
+/// line endpoints lie on it within tolerance; otherwise `None`.
+fn recognize_curve_form(s_a: &Surface, s_b: &Surface, start: &Point3, end: &Point3) -> Option<Curve> {
     match (s_a, s_b) {
-        (Surface::Plane(p), Surface::Cylinder(c)) => plane_cylinder_arc(p, c, start, end),
-        (Surface::Plane(p), Surface::Sphere(s)) => plane_sphere_arc(p, s, start, end),
+        (Surface::Plane(p), Surface::Cylinder(c)) => plane_cylinder_form(p, c, start, end),
+        (Surface::Plane(p), Surface::Sphere(s)) =>
+            plane_sphere_arc(p, s, start, end).map(Curve::CircularArc),
         _ => None,
     }
 }
 
-/// Plane ∩ Cylinder is a circle when the plane is perpendicular to
-/// the cylinder axis, an ellipse when oblique, two parallel lines
-/// when the plane contains the axis. We only emit the circle case
-/// here; oblique-plane ellipses would need ELLIPSE entities + their
-/// own validation pass.
-fn plane_cylinder_arc(p: &Plane, c: &Cylinder, start: &Point3, end: &Point3) -> Option<CircularArc> {
+/// Plane ∩ Cylinder is:
+///   - a circle when the plane is perpendicular to the cylinder axis,
+///   - an ellipse when oblique (axis crosses the plane non-perpendicularly),
+///   - two parallel lines or a single tangent line when the plane
+///     contains (or is parallel to) the axis — we leave those as
+///     polylines.
+///
+/// The center is where the cylinder axis pierces the plane. For the
+/// ellipse case: minor radius = cylinder radius, major radius =
+/// `r / |a·n|`, major axis = axis projected into the plane, normalized.
+fn plane_cylinder_form(p: &Plane, c: &Cylinder, start: &Point3, end: &Point3) -> Option<Curve> {
     let n = p.normal.normalize();
     let axis = c.axis.normalize();
-    // Plane perpendicular to cylinder axis → |n·axis| ≈ 1
-    if (n.dot(&axis).abs() - 1.0).abs() > 1e-6 {
+    let an = axis.dot(&n);
+    // Axis parallel to (or contained in) the plane: not a closed
+    // intersection. Skip.
+    if an.abs() < 1e-9 {
         return None;
     }
-    // Circle center: project cylinder origin onto the plane along axis
-    let to_origin = c.origin - p.origin;
-    let along = to_origin.dot(&n);
-    let center = c.origin - axis * (along / axis.dot(&n));
-    let radius = c.radius;
-    // Validate endpoints lie on the circle (in plane and at distance radius from center)
-    if !point_on_circle(start, &center, &axis, radius) { return None; }
-    if !point_on_circle(end, &center, &axis, radius) { return None; }
-    let (ref_dir, start_angle, end_angle) = arc_frame_and_angles(start, end, &center, &axis)?;
-    Some(CircularArc {
+    // Center: solve (c.origin + t·axis - p.origin) · n = 0.
+    let t = -(c.origin - p.origin).dot(&n) / an;
+    let center = c.origin + axis * t;
+
+    // Perpendicular case → circle.
+    if (an.abs() - 1.0).abs() <= 1e-6 {
+        let radius = c.radius;
+        if !point_on_circle(start, &center, &axis, radius) { return None; }
+        if !point_on_circle(end, &center, &axis, radius) { return None; }
+        let (ref_dir, start_angle, end_angle) = arc_frame_and_angles(start, end, &center, &axis)?;
+        return Some(Curve::CircularArc(CircularArc {
+            center,
+            normal: axis,
+            radius,
+            ref_direction: ref_dir,
+            start_angle,
+            end_angle,
+        }));
+    }
+
+    // Oblique case → ellipse in the plane.
+    let minor_radius = c.radius;
+    let major_radius = c.radius / an.abs();
+    // Major axis direction: project the cylinder axis onto the plane,
+    // normalize. The projection's magnitude is sqrt(1 - (a·n)²) ≥
+    // approx 1e-4 here because of the `|an| < 1 - 1e-6` branch.
+    let axis_in_plane = axis - n * an;
+    let axis_in_plane_len = axis_in_plane.norm();
+    if axis_in_plane_len < 1e-9 {
+        return None; // shouldn't happen given an check, but be defensive
+    }
+    let major_dir = axis_in_plane / axis_in_plane_len;
+    // Validate endpoints lie on the ellipse within tolerance.
+    if !point_on_ellipse(start, &center, &n, &major_dir, major_radius, minor_radius) {
+        return None;
+    }
+    if !point_on_ellipse(end, &center, &n, &major_dir, major_radius, minor_radius) {
+        return None;
+    }
+    let (start_angle, end_angle) =
+        ellipse_angles(start, end, &center, &n, &major_dir, major_radius, minor_radius)?;
+    Some(Curve::EllipticalArc(EllipticalArc {
         center,
-        normal: axis,
-        radius,
-        ref_direction: ref_dir,
+        normal: n,
+        major_axis: major_dir,
+        major_radius,
+        minor_radius,
         start_angle,
         end_angle,
-    })
+    }))
 }
 
 /// Plane ∩ Sphere is always a circle (or empty); center is the
@@ -597,6 +635,58 @@ fn point_on_circle(p: &Point3, center: &Point3, normal: &Vector3, radius: f64) -
     if along.abs() > UPGRADE_TOL { return false; }
     let radial = (v - normal * along).norm();
     (radial - radius).abs() <= UPGRADE_TOL
+}
+
+/// Point lies on the ellipse defined by (center, normal, major_dir,
+/// a, b) — i.e. in the plane (within tol) AND (u/a)² + (v/b)² ≈ 1
+/// where (u, v) are the point's coords in the ellipse's local frame.
+fn point_on_ellipse(
+    p: &Point3,
+    center: &Point3,
+    normal: &Vector3,
+    major_dir: &Vector3,
+    a: f64,
+    b: f64,
+) -> bool {
+    let v = p - center;
+    let along = v.dot(normal);
+    if along.abs() > UPGRADE_TOL { return false; }
+    let minor_dir = normal.cross(major_dir);
+    let u = v.dot(major_dir);
+    let w = v.dot(&minor_dir);
+    // Algebraic ellipse residual (u/a)² + (w/b)² - 1; scale-aware
+    // tolerance so a 0.5e-7 absolute error on a unit ellipse passes.
+    let residual = (u / a).powi(2) + (w / b).powi(2) - 1.0;
+    residual.abs() <= UPGRADE_TOL * (1.0 + 1.0 / a.min(b))
+}
+
+/// Solve the ellipse parameter t for each of `start` and `end` from
+/// the ellipse local frame: t such that point = center + a·cos(t)·M + b·sin(t)·m
+/// where M = major_dir, m = normal × major_dir. Returns (start_angle,
+/// end_angle), with end_angle normalized to lie in [start_angle,
+/// start_angle + TAU).
+fn ellipse_angles(
+    start: &Point3,
+    end: &Point3,
+    center: &Point3,
+    normal: &Vector3,
+    major_dir: &Vector3,
+    a: f64,
+    b: f64,
+) -> Option<(f64, f64)> {
+    let minor_dir = normal.cross(major_dir);
+    let angle_of = |p: &Point3| -> f64 {
+        let v = p - center;
+        let u = v.dot(major_dir) / a;
+        let w = v.dot(&minor_dir) / b;
+        w.atan2(u)
+    };
+    let s = angle_of(start);
+    let mut e = angle_of(end);
+    // Normalize so e ∈ (s, s + TAU].
+    while e <= s { e += std::f64::consts::TAU; }
+    while e > s + std::f64::consts::TAU { e -= std::f64::consts::TAU; }
+    Some((s, e))
 }
 
 /// Build a (ref_direction, start_angle, end_angle) tuple for an arc
