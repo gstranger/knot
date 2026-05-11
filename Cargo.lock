@@ -224,6 +224,7 @@ dependencies = [
  "js-sys",
  "knot-core",
  "knot-geom",
+ "knot-intersect",
  "knot-io",
  "knot-ops",
  "knot-tessellate",

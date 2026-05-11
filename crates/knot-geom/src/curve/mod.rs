@@ -2,6 +2,7 @@ pub mod nurbs;
 pub mod line;
 pub mod arc;
 pub mod offset;
+pub mod fit;
 
 use knot_core::Aabb3;
 use crate::point::{Point3, Vector3};
@@ -100,6 +101,148 @@ impl Curve {
             Curve::EllipticalArc(a) => a.bounding_box(),
         }
     }
+
+    /// Arc length. Closed-form for lines and circular arcs; adaptive
+    /// integration for NURBS; chord-sum-with-refinement for elliptical
+    /// arcs (whose arc length is an elliptic integral with no
+    /// elementary form).
+    pub fn length(&self, tolerance: f64) -> f64 {
+        match self {
+            Curve::Line(l) => l.length(),
+            Curve::CircularArc(a) => a.length(),
+            Curve::Nurbs(n) => n.length(tolerance),
+            Curve::EllipticalArc(_) => length_by_sampling(self, tolerance),
+        }
+    }
+
+    /// Split the curve at parameter `t` into two sub-curves. Errors if
+    /// `t` is outside `(domain.start, domain.end)`. Variant-on-input
+    /// = variant-on-output for all cases.
+    pub fn split_at(&self, t: CurveParam) -> Result<(Curve, Curve), &'static str> {
+        let domain = self.domain();
+        if t.0 <= domain.start || t.0 >= domain.end {
+            return Err("split_at: parameter outside (start, end)");
+        }
+        match self {
+            Curve::Line(l) => {
+                let (a, b) = l.split_at(t.0);
+                Ok((Curve::Line(a), Curve::Line(b)))
+            }
+            Curve::CircularArc(a) => {
+                let (l, r) = a.split_at(t.0);
+                Ok((Curve::CircularArc(l), Curve::CircularArc(r)))
+            }
+            Curve::EllipticalArc(a) => {
+                let mut left = a.clone();
+                let mut right = a.clone();
+                left.end_angle = t.0;
+                right.start_angle = t.0;
+                Ok((Curve::EllipticalArc(left), Curve::EllipticalArc(right)))
+            }
+            Curve::Nurbs(n) => {
+                let (l, r) = n.split_at(t.0);
+                Ok((Curve::Nurbs(l), Curve::Nurbs(r)))
+            }
+        }
+    }
+
+    /// Reversed-orientation copy. The 3D point set is identical;
+    /// only the parameterization runs the other way.
+    pub fn reverse(&self) -> Curve {
+        match self {
+            Curve::Line(l) => Curve::Line(l.reverse()),
+            Curve::CircularArc(a) => {
+                let mut r = a.clone();
+                r.start_angle = a.end_angle;
+                r.end_angle = a.start_angle;
+                Curve::CircularArc(r)
+            }
+            Curve::EllipticalArc(a) => {
+                let mut r = a.clone();
+                r.start_angle = a.end_angle;
+                r.end_angle = a.start_angle;
+                Curve::EllipticalArc(r)
+            }
+            Curve::Nurbs(n) => Curve::Nurbs(n.reverse()),
+        }
+    }
+
+    /// Return `n + 1` parameter values evenly spaced by arc length
+    /// (including both endpoints). For non-linearly-parameterized
+    /// curves this gives a very different distribution than dividing
+    /// the parameter domain evenly.
+    pub fn divide_by_length(&self, n: u32, _tolerance: f64) -> Vec<CurveParam> {
+        if n == 0 {
+            return vec![CurveParam(self.domain().start)];
+        }
+        let domain = self.domain();
+        // Sample density: enough for sub-tolerance interpolation on
+        // typical CAD curves. Could be made adaptive on `_tolerance`
+        // later if drift shows up on very curvy NURBS.
+        let samples = (256 * n as usize).max(256);
+        let dt = (domain.end - domain.start) / samples as f64;
+        let mut params = Vec::with_capacity(samples + 1);
+        let mut lengths = Vec::with_capacity(samples + 1);
+        params.push(domain.start);
+        lengths.push(0.0_f64);
+        let mut prev = self.point_at(CurveParam(domain.start));
+        for i in 1..=samples {
+            let t = domain.start + dt * i as f64;
+            let p = self.point_at(CurveParam(t));
+            let cum = lengths[i - 1] + (p - prev).norm();
+            params.push(t);
+            lengths.push(cum);
+            prev = p;
+        }
+        let total = *lengths.last().unwrap();
+        let mut out = Vec::with_capacity(n as usize + 1);
+        for i in 0..=n {
+            let target = total * i as f64 / n as f64;
+            let mut lo = 0usize;
+            let mut hi = lengths.len() - 1;
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if lengths[mid] <= target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let span = lengths[hi] - lengths[lo];
+            let frac = if span == 0.0 { 0.0 } else { (target - lengths[lo]) / span };
+            let t = params[lo] + frac * (params[hi] - params[lo]);
+            out.push(CurveParam(t));
+        }
+        out
+    }
+}
+
+fn length_by_sampling(curve: &Curve, tolerance: f64) -> f64 {
+    let mut n = 32usize;
+    let mut prev = chord_sum(curve, n);
+    for _ in 0..16 {
+        n *= 2;
+        let est = chord_sum(curve, n);
+        if (est - prev).abs() <= tolerance * est.abs().max(1.0) {
+            return est;
+        }
+        prev = est;
+    }
+    prev
+}
+
+fn chord_sum(curve: &Curve, n: usize) -> f64 {
+    let domain = curve.domain();
+    let dt = (domain.end - domain.start) / n as f64;
+    let mut prev = curve.point_at(CurveParam(domain.start));
+    let mut s = 0.0_f64;
+    for i in 1..=n {
+        let t = domain.start + dt * i as f64;
+        let p = curve.point_at(CurveParam(t));
+        s += (p - prev).norm();
+        prev = p;
+    }
+    s
 }
 
 /// Fallback closest-point using sampling (for curve types without analytical solution).

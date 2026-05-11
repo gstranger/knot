@@ -10,6 +10,7 @@ knot-geom = { path = "../knot-geom" }
 knot-topo = { path = "../knot-topo" }
 knot-ops = { path = "../knot-ops" }
 knot-tessellate = { path = "../knot-tessellate" }
+knot-intersect = { path = "../knot-intersect" }
 knot-io = { path = "../knot-io" }
 wasm-bindgen = { workspace = true }
 serde-wasm-bindgen = "0.6"

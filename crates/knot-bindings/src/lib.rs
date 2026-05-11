@@ -198,6 +198,95 @@ impl JsCurve {
             _ => Err(JsError::new("insert_knot is only available for NURBS curves")),
         }
     }
+
+    /// Full derivatives at parameter t.
+    /// Returns flat [px, py, pz, d1x, d1y, d1z, d2x, d2y, d2z]. When the
+    /// second derivative is unavailable, the last 3 entries are NaN.
+    pub fn derivatives_at(&self, t: f64) -> Vec<f64> {
+        let d = self.inner.derivatives_at(knot_geom::curve::CurveParam(t));
+        let (d2x, d2y, d2z) = match d.d2 {
+            Some(v) => (v.x, v.y, v.z),
+            None => (f64::NAN, f64::NAN, f64::NAN),
+        };
+        vec![d.point.x, d.point.y, d.point.z, d.d1.x, d.d1.y, d.d1.z, d2x, d2y, d2z]
+    }
+
+    /// Arc length of the curve. `tolerance` is the requested relative
+    /// accuracy; `1e-6` is comfortable for CAD-scale geometry.
+    pub fn length(&self, tolerance: f64) -> f64 {
+        self.inner.length(tolerance)
+    }
+
+    /// Split this curve at parameter `t`. Errors if `t` sits at or
+    /// outside the curve's domain endpoints. Returns two new curves;
+    /// the input is unchanged.
+    pub fn split_at(&self, t: f64) -> Result<JsCurveSplit, JsError> {
+        let (a, b) = self.inner
+            .split_at(knot_geom::curve::CurveParam(t))
+            .map_err(JsError::new)?;
+        Ok(JsCurveSplit {
+            left: Some(JsCurve { inner: a }),
+            right: Some(JsCurve { inner: b }),
+        })
+    }
+
+    /// Reversed-orientation copy of the curve. Same 3D point set,
+    /// opposite parameterization.
+    pub fn reverse(&self) -> JsCurve {
+        JsCurve { inner: self.inner.reverse() }
+    }
+
+    /// Divide the curve into `n` equal-arc-length segments. Returns
+    /// `n + 1` parameter values (including both domain endpoints).
+    /// Unlike `divide`, this is arc-length-uniform, not
+    /// parameter-uniform — meaningful for non-linearly-parameterized
+    /// curves (NURBS in particular).
+    pub fn divide_by_length(&self, n: u32, tolerance: f64) -> Vec<f64> {
+        self.inner
+            .divide_by_length(n, tolerance)
+            .into_iter()
+            .map(|p| p.0)
+            .collect()
+    }
+
+    /// Intersect this curve with `other`. Returns a flat array of hits:
+    /// `[t_a, t_b, x, y, z, t_a, t_b, x, y, z, ...]`. Empty when there
+    /// are no intersections within `tolerance`.
+    pub fn intersect(&self, other: &JsCurve, tolerance: f64) -> Result<Vec<f64>, JsError> {
+        let hits = knot_intersect::curve_curve::intersect_curves(
+            &self.inner,
+            &other.inner,
+            tolerance,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))?;
+        let mut out = Vec::with_capacity(hits.len() * 5);
+        for h in hits {
+            out.push(h.param_a.0);
+            out.push(h.param_b.0);
+            out.push(h.point.x);
+            out.push(h.point.y);
+            out.push(h.point.z);
+        }
+        Ok(out)
+    }
+}
+
+/// Two-curve split result. Used because `wasm-bindgen` does not yet
+/// permit returning a tuple of opaque handles directly.
+#[wasm_bindgen]
+pub struct JsCurveSplit {
+    left: Option<JsCurve>,
+    right: Option<JsCurve>,
+}
+
+#[wasm_bindgen]
+impl JsCurveSplit {
+    pub fn left(&mut self) -> Option<JsCurve> {
+        self.left.take()
+    }
+    pub fn right(&mut self) -> Option<JsCurve> {
+        self.right.take()
+    }
 }
 
 // ── Surface API ──

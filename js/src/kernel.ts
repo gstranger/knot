@@ -8,6 +8,7 @@
 import type {
   JsBrep as RawBrep,
   JsCurve as RawCurve,
+  JsCurveSplit as RawCurveSplit,
   JsSurfaceMesh as RawMesh,
   InitInput as WasmInitInput,
 } from 'knot-wasm';
@@ -175,6 +176,89 @@ export class Curve {
    */
   offset(distance: number, planeNormal: Vec3): Curve {
     return new Curve(this._raw.offset(distance, planeNormal.x, planeNormal.y, planeNormal.z));
+  }
+
+  /**
+   * Full derivative information at parameter `t`.
+   *
+   * `d2` is `null` when a second derivative is unavailable (currently
+   * never the case — every variant supplies one — but the field is
+   * typed nullable to keep the API stable if a non-C² primitive is
+   * added later).
+   */
+  derivativesAt(t: number): { point: Vec3; d1: Vec3; d2: Vec3 | null } {
+    const r = this._raw.derivatives_at(t);
+    const d2: Vec3 | null = Number.isNaN(r[6]!)
+      ? null
+      : { x: r[6]!, y: r[7]!, z: r[8]! };
+    return {
+      point: { x: r[0]!, y: r[1]!, z: r[2]! },
+      d1: { x: r[3]!, y: r[4]!, z: r[5]! },
+      d2,
+    };
+  }
+
+  /**
+   * Arc length of the curve.
+   *
+   * Closed-form for lines and circular arcs. Numerical for NURBS
+   * (adaptive integration) and elliptical arcs (chord-sum with
+   * refinement). `tolerance` is the requested relative accuracy;
+   * `1e-6` is comfortable for CAD-scale geometry.
+   */
+  length(tolerance: number = 1e-6): number {
+    return this._raw.length(tolerance);
+  }
+
+  /**
+   * Split at parameter `t` into two sub-curves. Both sub-curves are
+   * new WASM-owned handles; this curve is unchanged. Throws if `t`
+   * is at or outside the domain endpoints.
+   */
+  splitAt(t: number): { left: Curve; right: Curve } {
+    const split: RawCurveSplit = this._raw.split_at(t);
+    const left = split.left();
+    const right = split.right();
+    split.free();
+    if (!left || !right) throw new Error('splitAt returned an empty side');
+    return { left: new Curve(left), right: new Curve(right) };
+  }
+
+  /** Reversed-orientation copy of the curve. */
+  reverse(): Curve {
+    return new Curve(this._raw.reverse());
+  }
+
+  /**
+   * `n+1` parameter values dividing the curve into `n` segments of
+   * **equal arc length**. Different from `divide`, which divides
+   * parameter space; for non-linearly-parameterized curves (NURBS in
+   * particular) the two distributions can be very different.
+   */
+  divideByLength(n: number, tolerance: number = 1e-6): number[] {
+    return Array.from(this._raw.divide_by_length(n, tolerance));
+  }
+
+  /**
+   * Intersect with `other`. Returns a list of intersection hits, each
+   * with the parameter on this curve, the parameter on `other`, and the
+   * 3D point. Empty when there are no intersections within `tolerance`.
+   */
+  intersect(other: Curve, tolerance: number = 1e-6): Array<{
+    paramA: number;
+    paramB: number;
+    point: Vec3;
+  }> {
+    const flat = this._raw.intersect(other._raw, tolerance);
+    const out: Array<{ paramA: number; paramB: number; point: Vec3 }> = [];
+    for (let i = 0; i < flat.length; i += 5) {
+      out.push({
+        paramA: flat[i]!,
+        paramB: flat[i + 1]!,
+        point: { x: flat[i + 2]!, y: flat[i + 3]!, z: flat[i + 4]! },
+      });
+    }
+    return out;
   }
 
   /** Release WASM memory. */
