@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   # Reproducible builds: pin to a specific Rust release to avoid
   # toolchain drift between runs. Bump deliberately.
-  RUST_TOOLCHAIN: "1.83.0"
+  RUST_TOOLCHAIN: "1.85.0"
 
 jobs:
   rust:

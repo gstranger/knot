@@ -6,16 +6,28 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 use knot_core::{KResult, KernelError};
 use knot_geom::Point3;
 use knot_geom::Vector3;
-use knot_geom::curve::Curve;
-use knot_geom::surface::Surface;
+use knot_geom::curve::{Curve, CircularArc};
+use knot_geom::surface::{Surface, Plane, Cylinder, Sphere};
 use knot_topo::*;
 
 /// Write a BRep to a STEP AP203 string.
+///
+/// Before serializing, performs a trim-curve upgrade pass: for each
+/// edge that lies between two analytical surfaces (plane/cylinder/
+/// sphere combinations), if the edge is currently a polygonal `Line`
+/// approximation of the analytical intersection, emit the analytical
+/// curve (CIRCLE / ELLIPSE) instead. Downstream CAD tools then see
+/// clean geometry instead of N-segment polylines.
+///
+/// The kernel keeps its internal polygonal representation (good for
+/// boolean robustness); the upgrade is export-time only.
 pub fn write_step(brep: &BRep) -> KResult<String> {
-    let mut ctx = WriteContext::new();
+    let edge_surfaces = build_edge_surface_map(brep);
+    let mut ctx = WriteContext::new(edge_surfaces);
     let solid_ids = ctx.collect_brep(brep)?;
 
     let mut out = String::with_capacity(4096);
@@ -58,6 +70,18 @@ struct WriteContext {
     vertex_cache: HashMap<u64, u64>,   // vertex Id hash → STEP entity id
     edge_cache: HashMap<u64, u64>,     // edge Id hash → STEP EDGE_CURVE id
     surface_cache: HashMap<u64, u64>,  // surface pointer → STEP entity id
+    /// sorted-vertex-pair-key → list of adjacent face surfaces. Used
+    /// at edge-export time to upgrade polygonal trim curves to their
+    /// analytical form (e.g. plane∩cylinder = circle).
+    ///
+    /// Key is `(min(vid_a, vid_b), max(vid_a, vid_b))` of the vertex
+    /// content hashes, not the edge hash. Primitive constructors
+    /// (`make_cylinder`, `make_box`, …) build separate `Edge` Arcs
+    /// for adjacent faces sharing the same endpoint vertices; using
+    /// the edge hash directly would leave each edge entry with only
+    /// its own face's surface. Vertex content hashes are stable and
+    /// shared as long as the underlying Point3 bit-equals.
+    edge_surfaces: HashMap<(u64, u64), Vec<Arc<Surface>>>,
 }
 
 /// Hashable 3D point key (f64 bits).
@@ -74,7 +98,7 @@ impl PointKey {
 }
 
 impl WriteContext {
-    fn new() -> Self {
+    fn new(edge_surfaces: HashMap<(u64, u64), Vec<Arc<Surface>>>) -> Self {
         Self {
             next_id: 1,
             entities: Vec::new(),
@@ -83,6 +107,7 @@ impl WriteContext {
             vertex_cache: HashMap::new(),
             edge_cache: HashMap::new(),
             surface_cache: HashMap::new(),
+            edge_surfaces,
         }
     }
 
@@ -173,7 +198,18 @@ impl WriteContext {
 
         let v_start = self.collect_vertex(edge.start())?;
         let v_end = self.collect_vertex(edge.end())?;
-        let curve_id = self.collect_curve(edge.curve(), edge.start().point(), edge.end().point())?;
+        // Export-time trim upgrade: if the edge is a polygonal Line
+        // approximation but its adjacent surfaces have an analytical
+        // intersection form (plane∩cylinder=circle, plane∩sphere=circle),
+        // emit the analytical curve instead. Falls back to the original
+        // curve when no upgrade applies.
+        let upgraded = upgrade_curve_for_export(
+            edge.curve(),
+            edge.start().point(),
+            edge.end().point(),
+            self.edge_surfaces.get(&edge_vertex_key(edge)),
+        );
+        let curve_id = self.collect_curve(&upgraded, edge.start().point(), edge.end().point())?;
 
         let edge_id = self.alloc();
         self.push(edge_id, format!(
@@ -411,6 +447,184 @@ fn fmt_f(v: f64) -> String {
 /// Format a list of entity IDs as "#1,#2,#3".
 fn id_list(ids: &[u64]) -> String {
     ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(",")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Trim-curve upgrade (export-time)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-edge tolerance for accepting an analytical upgrade. The line
+/// endpoints have to lie on the proposed curve within this distance,
+/// otherwise we keep the polygonal form to stay correct.
+const UPGRADE_TOL: f64 = 1e-6;
+
+/// Walk the BRep once and accumulate, for each edge, the surfaces of
+/// every face that uses that edge in its outer / inner loops. Used
+/// by the writer to decide whether a polygonal trim curve can be
+/// upgraded to its analytical form.
+fn build_edge_surface_map(brep: &BRep) -> HashMap<(u64, u64), Vec<Arc<Surface>>> {
+    let mut map: HashMap<(u64, u64), Vec<Arc<Surface>>> = HashMap::new();
+    for solid in brep.solids() {
+        for face in solid.outer_shell().faces() {
+            let surface = face.surface().clone();
+            let loops_iter = std::iter::once(face.outer_loop())
+                .chain(face.inner_loops().iter());
+            for loop_ in loops_iter {
+                for he in loop_.half_edges() {
+                    let key = edge_vertex_key(he.edge());
+                    map.entry(key).or_default().push(surface.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn edge_vertex_key(edge: &Edge) -> (u64, u64) {
+    let a = edge.start().id().hash_value();
+    let b = edge.end().id().hash_value();
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// If `curve` is a polygonal `Line` between two analytical surfaces
+/// with a recognized intersection form, return the analytical curve.
+/// Otherwise return `curve.clone()`. Validates endpoints lie on the
+/// proposed curve within `UPGRADE_TOL` before accepting.
+fn upgrade_curve_for_export(
+    curve: &Curve,
+    start: &Point3,
+    end: &Point3,
+    surfaces: Option<&Vec<Arc<Surface>>>,
+) -> Curve {
+    if !matches!(curve, Curve::Line(_)) {
+        return curve.clone();
+    }
+    let surfaces = match surfaces {
+        Some(s) if s.len() >= 2 => s,
+        _ => return curve.clone(),
+    };
+    // Try every ordered pair of adjacent surfaces. The first match wins.
+    for i in 0..surfaces.len() {
+        for j in 0..surfaces.len() {
+            if i == j { continue; }
+            if let Some(arc) = recognize_arc(
+                surfaces[i].as_ref(),
+                surfaces[j].as_ref(),
+                start,
+                end,
+            ) {
+                return Curve::CircularArc(arc);
+            }
+        }
+    }
+    curve.clone()
+}
+
+/// Match the ordered surface pair against known analytical
+/// intersection forms (plane∩cylinder, plane∩sphere). Returns a
+/// circular arc whose underlying full circle is the intersection
+/// circle and whose start/end angles are derived from the line
+/// endpoints. Returns `None` when the configuration isn't one of
+/// the recognized cases or when the line endpoints don't lie on
+/// the proposed circle within tolerance.
+fn recognize_arc(s_a: &Surface, s_b: &Surface, start: &Point3, end: &Point3) -> Option<CircularArc> {
+    match (s_a, s_b) {
+        (Surface::Plane(p), Surface::Cylinder(c)) => plane_cylinder_arc(p, c, start, end),
+        (Surface::Plane(p), Surface::Sphere(s)) => plane_sphere_arc(p, s, start, end),
+        _ => None,
+    }
+}
+
+/// Plane ∩ Cylinder is a circle when the plane is perpendicular to
+/// the cylinder axis, an ellipse when oblique, two parallel lines
+/// when the plane contains the axis. We only emit the circle case
+/// here; oblique-plane ellipses would need ELLIPSE entities + their
+/// own validation pass.
+fn plane_cylinder_arc(p: &Plane, c: &Cylinder, start: &Point3, end: &Point3) -> Option<CircularArc> {
+    let n = p.normal.normalize();
+    let axis = c.axis.normalize();
+    // Plane perpendicular to cylinder axis → |n·axis| ≈ 1
+    if (n.dot(&axis).abs() - 1.0).abs() > 1e-6 {
+        return None;
+    }
+    // Circle center: project cylinder origin onto the plane along axis
+    let to_origin = c.origin - p.origin;
+    let along = to_origin.dot(&n);
+    let center = c.origin - axis * (along / axis.dot(&n));
+    let radius = c.radius;
+    // Validate endpoints lie on the circle (in plane and at distance radius from center)
+    if !point_on_circle(start, &center, &axis, radius) { return None; }
+    if !point_on_circle(end, &center, &axis, radius) { return None; }
+    let (ref_dir, start_angle, end_angle) = arc_frame_and_angles(start, end, &center, &axis)?;
+    Some(CircularArc {
+        center,
+        normal: axis,
+        radius,
+        ref_direction: ref_dir,
+        start_angle,
+        end_angle,
+    })
+}
+
+/// Plane ∩ Sphere is always a circle (or empty); center is the
+/// projection of the sphere center onto the plane, radius is
+/// `sqrt(r² - d²)` where d is sphere-center-to-plane distance.
+fn plane_sphere_arc(p: &Plane, s: &Sphere, start: &Point3, end: &Point3) -> Option<CircularArc> {
+    let n = p.normal.normalize();
+    let d = n.dot(&(s.center - p.origin));
+    let r2 = s.radius * s.radius - d * d;
+    if r2 < 1e-18 {
+        return None; // plane tangent or missing the sphere
+    }
+    let radius = r2.sqrt();
+    let center = s.center - n * d;
+    if !point_on_circle(start, &center, &n, radius) { return None; }
+    if !point_on_circle(end, &center, &n, radius) { return None; }
+    let (ref_dir, start_angle, end_angle) = arc_frame_and_angles(start, end, &center, &n)?;
+    Some(CircularArc {
+        center,
+        normal: n,
+        radius,
+        ref_direction: ref_dir,
+        start_angle,
+        end_angle,
+    })
+}
+
+fn point_on_circle(p: &Point3, center: &Point3, normal: &Vector3, radius: f64) -> bool {
+    let v = p - center;
+    let along = v.dot(normal);
+    if along.abs() > UPGRADE_TOL { return false; }
+    let radial = (v - normal * along).norm();
+    (radial - radius).abs() <= UPGRADE_TOL
+}
+
+/// Build a (ref_direction, start_angle, end_angle) tuple for an arc
+/// whose underlying circle is centered at `center` with the given
+/// `normal`. `ref_direction` is chosen so that `start` lies at the
+/// `start_angle` measured from it.
+fn arc_frame_and_angles(
+    start: &Point3,
+    end: &Point3,
+    center: &Point3,
+    normal: &Vector3,
+) -> Option<(Vector3, f64, f64)> {
+    let n = normal.normalize();
+    let v_start = start - center;
+    let v_end = end - center;
+    let r_start = v_start - n * v_start.dot(&n);
+    let r_end = v_end - n * v_end.dot(&n);
+    let r_len = r_start.norm();
+    if r_len < UPGRADE_TOL { return None; }
+    let ref_dir = r_start / r_len;
+    let bi = n.cross(&ref_dir);
+    let u_end = r_end.dot(&ref_dir);
+    let v_end = r_end.dot(&bi);
+    let mut end_angle = v_end.atan2(u_end);
+    if end_angle < 0.0 {
+        end_angle += std::f64::consts::TAU;
+    }
+    Some((ref_dir, 0.0, end_angle))
 }
 
 /// Compress an expanded knot vector into (unique_values, multiplicities).
