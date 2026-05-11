@@ -126,6 +126,25 @@ fn boolean_inner(a: &BRep, b: &BRep, op: BooleanOp) -> KResult<BRep> {
     let faces_b: Vec<&Face> = solid_b.outer_shell().faces().iter().collect();
     _trace_stage("setup", _stage_start);
 
+    // ── Coincident-solid fast-path ──
+    //
+    // If A and B are the same shape (same face multiset by surface
+    // kind and lattice-rounded outer-loop vertex set), the boolean
+    // has a closed-form result: Union/Intersection → A, Subtraction
+    // → empty. Catches duplicated-input cases like ABC corpus pair
+    // (11, 12) where SSI between coincident NURBS surfaces would
+    // otherwise spin past the wall-clock budget.
+    //
+    // Conservative: we only return early on a strict multiset match.
+    // A false positive would corrupt the boolean; false negatives
+    // just fall through to the regular pipeline.
+    if let Some(result) = try_coincident_fast_path(a, &faces_a, &faces_b, op, &grid) {
+        if _trace_enabled {
+            eprintln!("  [boolean trace] coincident-solid fast-path hit");
+        }
+        return result;
+    }
+
     // Step 2: Face-face overlap filtering via bounding boxes
     let _stage_start = _now();
     let candidate_pairs = find_candidate_pairs(&faces_a, &faces_b, tolerance);
@@ -605,6 +624,55 @@ fn face_loop_points(face: &Face) -> Vec<Point3> {
         .iter()
         .map(|he| *he.start_vertex().point())
         .collect()
+}
+
+/// Per-face identity signature: (surface kind, sorted lattice-rounded
+/// outer-loop vertex keys). Two faces with the same signature occupy
+/// the same surface type and the same set of boundary vertices on the
+/// snap grid — strong evidence they're geometrically the same face.
+fn face_signature(face: &Face, grid: &SnapGrid) -> (u8, Vec<LatticeIndex>) {
+    let kind: u8 = match face.surface().as_ref() {
+        Surface::Plane(_) => 0,
+        Surface::Sphere(_) => 1,
+        Surface::Cylinder(_) => 2,
+        Surface::Cone(_) => 3,
+        Surface::Torus(_) => 4,
+        Surface::Nurbs(_) => 5,
+    };
+    let mut keys: Vec<LatticeIndex> = face.outer_loop().half_edges()
+        .iter()
+        .map(|he| grid.lattice_index(*he.start_vertex().point()))
+        .collect();
+    keys.sort();
+    (kind, keys)
+}
+
+fn try_coincident_fast_path(
+    a: &BRep,
+    faces_a: &[&Face],
+    faces_b: &[&Face],
+    op: BooleanOp,
+    grid: &SnapGrid,
+) -> Option<KResult<BRep>> {
+    if faces_a.len() != faces_b.len() {
+        return None;
+    }
+    let mut sigs_a: Vec<(u8, Vec<LatticeIndex>)> =
+        faces_a.iter().map(|f| face_signature(f, grid)).collect();
+    let mut sigs_b: Vec<(u8, Vec<LatticeIndex>)> =
+        faces_b.iter().map(|f| face_signature(f, grid)).collect();
+    sigs_a.sort();
+    sigs_b.sort();
+    if sigs_a != sigs_b {
+        return None;
+    }
+    Some(match op {
+        BooleanOp::Union | BooleanOp::Intersection => Ok(a.clone()),
+        BooleanOp::Subtraction => Err(KernelError::OperationFailed {
+            code: ErrorCode::EmptyResult,
+            detail: "boolean A − A is empty".into(),
+        }),
+    })
 }
 
 fn face_bbox(face: &Face, margin: f64) -> Aabb3 {
