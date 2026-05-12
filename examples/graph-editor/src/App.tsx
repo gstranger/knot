@@ -21,7 +21,7 @@ import { Joyride, type Step, type EventData, STATUS } from 'react-joyride';
 
 import { createKnot, type Knot, type MeshData } from 'knot-cad';
 import { Graph, Evaluator, buildDefaultRegistry } from 'knot-cad/graph';
-import type { NodeRegistry } from 'knot-cad/graph';
+import type { NodeRegistry, GraphData } from 'knot-cad/graph';
 import { FormView } from 'knot-cad/react';
 
 import { CadNode, type CadNodeData } from './CadNode';
@@ -296,6 +296,108 @@ export function App() {
     [runEval],
   );
 
+  // ── Save / Load ──────────────────────────────────────────────
+  //
+  // File format: `{ formatVersion, graph: GraphData, layout }`.
+  // `graph` is the kernel's serializable form (nodes + wires +
+  // constants). `layout` carries the editor-only state — React Flow
+  // positions and the next-spawn cursor — so a reload puts every
+  // node back where the author dropped it.
+  const handleSave = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+    let graphData: GraphData;
+    try {
+      graphData = graph.toJSON();
+    } catch (e) {
+      console.error('Save failed (non-JSON-safe constant?):', e);
+      alert(`Save failed: ${(e as Error).message}`);
+      return;
+    }
+    const file = {
+      formatVersion: 1 as const,
+      graph: graphData,
+      layout: {
+        positions: rfNodes.reduce<Record<string, { x: number; y: number }>>((acc, n) => {
+          acc[n.id] = { x: n.position.x, y: n.position.y };
+          return acc;
+        }, {}),
+        nextPos: { ...nextPos.current },
+      },
+    };
+    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `knot-graph-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [rfNodes]);
+
+  // Hidden file input — clicking the Load button trips this.
+  const loadInputRef = useRef<HTMLInputElement>(null);
+
+  const handleLoadFile = useCallback(async (file: File) => {
+    const registry = registryRef.current;
+    const ev = evalRef.current;
+    if (!registry || !ev) return;
+    let parsed: { formatVersion?: number; graph?: GraphData; layout?: { positions?: Record<string, { x: number; y: number }>; nextPos?: { x: number; y: number } } };
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      alert(`Load failed: not valid JSON (${(e as Error).message})`);
+      return;
+    }
+    if (parsed.formatVersion !== 1) {
+      alert(`Load failed: unsupported formatVersion ${parsed.formatVersion}`);
+      return;
+    }
+    if (!parsed.graph) {
+      alert('Load failed: file has no graph');
+      return;
+    }
+    let nextGraph: Graph;
+    try {
+      nextGraph = Graph.fromJSON(parsed.graph, registry);
+    } catch (e) {
+      alert(`Load failed: ${(e as Error).message}`);
+      return;
+    }
+    // Swap in the new graph; clear evaluator cache so every node
+    // gets re-run on the next eval rather than serving stale values
+    // keyed by old node ids.
+    graphRef.current = nextGraph;
+    ev.dispose();
+    evalRef.current = new Evaluator({
+      onEvaluate: (id, defId) => console.log(`[eval] ${id} (${defId})`),
+    });
+
+    // Rebuild RF state from the loaded graph + layout.
+    const positions = parsed.layout?.positions ?? {};
+    const newRfNodes: Node[] = [];
+    for (const [id] of nextGraph.nodes) {
+      const pos = positions[id] ?? { x: 50 + newRfNodes.length * 30, y: 50 + newRfNodes.length * 40 };
+      newRfNodes.push(toRfNode(id, pos));
+    }
+    const newRfEdges: Edge[] = nextGraph.wires.map((w) => ({
+      id: `${w.fromNode}.${w.fromPort}-${w.toNode}.${w.toPort}`,
+      source: w.fromNode, sourceHandle: w.fromPort,
+      target: w.toNode, targetHandle: w.toPort,
+    }));
+    setRfNodes(newRfNodes);
+    setRfEdges(newRfEdges);
+
+    if (parsed.layout?.nextPos) nextPos.current = { ...parsed.layout.nextPos };
+
+    runEval();
+  }, [toRfNode, runEval, setRfNodes, setRfEdges]);
+
+  const handleLoadClick = useCallback(() => {
+    loadInputRef.current?.click();
+  }, []);
+
   // ── Delete edges ─────────────────────────────────────────────
   const onEdgesDelete: OnEdgesDelete = useCallback(
     (deleted) => {
@@ -415,6 +517,30 @@ export function App() {
       />
       {/* Palette */}
       <div data-tour="palette" style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <input
+          ref={loadInputRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) handleLoadFile(f);
+            // Reset so picking the same file again re-fires onChange.
+            e.target.value = '';
+          }}
+        />
+        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+          <button
+            onClick={handleSave}
+            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
+            title="Download graph as JSON"
+          >Save</button>
+          <button
+            onClick={handleLoadClick}
+            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
+            title="Load a previously saved graph"
+          >Load</button>
+        </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <span style={{ fontWeight: 700, fontSize: 14 }}>Add Node</span>
           <button
