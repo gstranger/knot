@@ -24,13 +24,31 @@ use knot_tessellate::{tessellate, TessellateOptions};
 /// given corpus produces a fixed sequence and reliability numbers
 /// are comparable run-to-run.
 fn find_step_files(max_files: usize) -> Vec<PathBuf> {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let abc_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
         .join("data").join("abc");
 
-    if !base.exists() {
+    if !abc_root.exists() {
         return Vec::new();
     }
+
+    // Honor `KNOT_ABC_CHUNK=NNNN` to run the harness against a
+    // specific chunk directory. Without it we walk every chunk
+    // present (default historical behavior). Setting the env var
+    // is the only safe way to compare reliability across chunks
+    // when multiple are extracted on disk.
+    let base = match std::env::var("KNOT_ABC_CHUNK") {
+        Ok(chunk) => {
+            let chunk_dir = abc_root.join(&chunk);
+            if !chunk_dir.exists() {
+                eprintln!("KNOT_ABC_CHUNK={} not found under {}", chunk, abc_root.display());
+                return Vec::new();
+            }
+            eprintln!("ABC chunk: {}", chunk);
+            chunk_dir
+        }
+        Err(_) => abc_root,
+    };
 
     let mut files = Vec::new();
     walk_dir(&base, usize::MAX, &mut files);

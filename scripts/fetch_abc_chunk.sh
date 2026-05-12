@@ -11,9 +11,28 @@ CHUNK=${1:-0}
 CHUNK_PAD=$(printf "%04d" "$CHUNK")
 DEST_DIR="data/abc"
 ARCHIVE="abc_${CHUNK_PAD}_step_v00.7z"
-URL="https://archive.nyu.edu/rest/fb/data/abc/${ARCHIVE}"
+
+# ABC dataset hosts its chunks behind opaque NYU bitstream IDs. The
+# `step_v00.txt` manifest lists them all. We fetch the manifest once
+# (or use a cached copy) and look up this chunk's URL.
+#
+# The fixed-URL pattern that used to work
+# (https://archive.nyu.edu/rest/fb/data/abc/abc_XXXX_step_v00.7z) was
+# retired sometime in 2025.
+MANIFEST_URL="https://deep-geometry.github.io/abc-dataset/data/step_v00.txt"
 
 mkdir -p "$DEST_DIR"
+
+if [ ! -f "$DEST_DIR/.manifest" ]; then
+  echo "Fetching ABC manifest..."
+  curl -sL "$MANIFEST_URL" -o "$DEST_DIR/.manifest"
+fi
+
+URL=$(awk -v a="$ARCHIVE" '$2 == a { print $1 }' "$DEST_DIR/.manifest")
+if [ -z "$URL" ]; then
+  echo "No manifest entry for $ARCHIVE — chunk number may be out of range."
+  exit 1
+fi
 
 if [ -d "$DEST_DIR/$CHUNK_PAD" ] && [ "$(ls "$DEST_DIR/$CHUNK_PAD"/*.step 2>/dev/null | head -1)" ]; then
     echo "Chunk $CHUNK_PAD already extracted at $DEST_DIR/$CHUNK_PAD"
