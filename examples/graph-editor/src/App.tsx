@@ -206,6 +206,55 @@ export function App() {
     setMeshes(newMeshes);
   }, []);
 
+  // ── Undo / Redo ──────────────────────────────────────────────
+  //
+  // Snapshot-based: every mutation pushes the current graph state
+  // onto an undo stack before running. Cmd-Z pops, restores, and
+  // pushes the previous state onto a redo stack. Cmd-Shift-Z does
+  // the reverse.
+  //
+  // Snapshots are full `Graph.toJSON()` serializations plus the
+  // editor's RF node positions, so visual layout round-trips too.
+  // Stack capped at UNDO_LIMIT entries to bound memory.
+  const undoStackRef = useRef<string[]>([]);
+  const redoStackRef = useRef<string[]>([]);
+  const UNDO_LIMIT = 50;
+  // Set while applying a snapshot so any cascading mutation hooks
+  // don't push themselves onto the undo stack and corrupt redo.
+  const restoringRef = useRef(false);
+
+  const captureSnapshot = useCallback((): string | null => {
+    const graph = graphRef.current;
+    if (!graph) return null;
+    try {
+      return JSON.stringify({
+        graph: graph.toJSON(),
+        layout: {
+          positions: rfNodes.reduce<Record<string, { x: number; y: number }>>((acc, n) => {
+            acc[n.id] = { x: n.position.x, y: n.position.y };
+            return acc;
+          }, {}),
+          nextPos: { ...nextPos.current },
+        },
+      });
+    } catch {
+      // Non-JSON-safe constants — skip the snapshot. The mutation
+      // proceeds; undo will jump past this state but never lose
+      // earlier ones.
+      return null;
+    }
+  }, [rfNodes]);
+
+  const pushUndo = useCallback(() => {
+    if (restoringRef.current) return;
+    const snap = captureSnapshot();
+    if (!snap) return;
+    const stack = undoStackRef.current;
+    stack.push(snap);
+    if (stack.length > UNDO_LIMIT) stack.shift();
+    redoStackRef.current.length = 0;
+  }, [captureSnapshot]);
+
   // ── Graph node → RF node ─────────────────────────────────────
   const toRfNode = useCallback(
     (nodeId: string, pos: { x: number; y: number }): Node => {
@@ -219,6 +268,7 @@ export function App() {
         outputs: Object.entries(def.outputs).map(([name, spec]: [string, any]) => ({ name, kind: spec.kind })),
         constants: { ...inst.constants },
         onConstantChange: (port, value) => {
+          pushUndo();
           graph.setConstant(nodeId, port, value);
           evalRef.current?.markDirty(nodeId);
           runEval();
@@ -233,7 +283,7 @@ export function App() {
       };
       return { id: nodeId, type: 'cad', position: pos, data } as unknown as Node;
     },
-    [runEval],
+    [runEval, pushUndo, setRfNodes],
   );
 
   // ── Add node ─────────────────────────────────────────────────
@@ -257,13 +307,14 @@ export function App() {
       if (defId === 'math.expression') {
         constants.expr ??= 'a';
       }
+      pushUndo();
       const nodeId = graph.addNode(defId, constants);
       const pos = { ...nextPos.current };
       nextPos.current = { x: pos.x + 30, y: pos.y + 40 };
       setRfNodes((nds) => [...nds, toRfNode(nodeId, pos)]);
       runEval();
     },
-    [toRfNode, runEval],
+    [toRfNode, runEval, pushUndo, setRfNodes],
   );
 
   // ── Connect ──────────────────────────────────────────────────
@@ -271,13 +322,21 @@ export function App() {
     (conn: Connection) => {
       const graph = graphRef.current;
       if (!graph || !conn.source || !conn.target || !conn.sourceHandle || !conn.targetHandle) return;
+      pushUndo();
       try { graph.connect(conn.source, conn.sourceHandle, conn.target, conn.targetHandle); }
-      catch (e) { console.warn('connect rejected:', (e as Error).message); return; }
+      catch (e) {
+        console.warn('connect rejected:', (e as Error).message);
+        // Roll back the snapshot we just pushed — the user didn't
+        // actually mutate, so undo shouldn't bring them back to
+        // pre-attempt state.
+        undoStackRef.current.pop();
+        return;
+      }
       setRfEdges((eds) => addEdge(conn, eds));
       evalRef.current?.markDirty(conn.target);
       runEval();
     },
-    [runEval],
+    [runEval, pushUndo, setRfEdges],
   );
 
   // ── Delete nodes ─────────────────────────────────────────────
@@ -285,6 +344,7 @@ export function App() {
     (deleted) => {
       const graph = graphRef.current;
       if (!graph) return;
+      pushUndo();
       for (const n of deleted) { evalRef.current?.evict(n.id); graph.removeNode(n.id); }
       setRfEdges(graph.wires.map((w) => ({
         id: `${w.fromNode}.${w.fromPort}-${w.toNode}.${w.toPort}`,
@@ -293,7 +353,7 @@ export function App() {
       })));
       runEval();
     },
-    [runEval],
+    [runEval, pushUndo, setRfEdges],
   );
 
   // ── Save / Load ──────────────────────────────────────────────
@@ -339,42 +399,29 @@ export function App() {
   // Hidden file input — clicking the Load button trips this.
   const loadInputRef = useRef<HTMLInputElement>(null);
 
-  const handleLoadFile = useCallback(async (file: File) => {
+  type LoadedFile = {
+    graph: GraphData;
+    layout?: { positions?: Record<string, { x: number; y: number }>; nextPos?: { x: number; y: number } };
+  };
+
+  // Apply a parsed graph+layout to the editor. Shared by Load,
+  // Undo, and Redo — the only difference between them is how the
+  // snapshot got chosen. Throws on registry/wire/cycle errors;
+  // callers surface those to the user as appropriate.
+  const applyGraphData = useCallback((parsed: LoadedFile) => {
     const registry = registryRef.current;
     const ev = evalRef.current;
     if (!registry || !ev) return;
-    let parsed: { formatVersion?: number; graph?: GraphData; layout?: { positions?: Record<string, { x: number; y: number }>; nextPos?: { x: number; y: number } } };
-    try {
-      parsed = JSON.parse(await file.text());
-    } catch (e) {
-      alert(`Load failed: not valid JSON (${(e as Error).message})`);
-      return;
-    }
-    if (parsed.formatVersion !== 1) {
-      alert(`Load failed: unsupported formatVersion ${parsed.formatVersion}`);
-      return;
-    }
-    if (!parsed.graph) {
-      alert('Load failed: file has no graph');
-      return;
-    }
-    let nextGraph: Graph;
-    try {
-      nextGraph = Graph.fromJSON(parsed.graph, registry);
-    } catch (e) {
-      alert(`Load failed: ${(e as Error).message}`);
-      return;
-    }
-    // Swap in the new graph; clear evaluator cache so every node
-    // gets re-run on the next eval rather than serving stale values
-    // keyed by old node ids.
+    const nextGraph = Graph.fromJSON(parsed.graph, registry);
+
+    // Swap in the new graph; dispose the old evaluator so cached
+    // outputs keyed by old node ids don't leak.
     graphRef.current = nextGraph;
     ev.dispose();
     evalRef.current = new Evaluator({
-      onEvaluate: (id, defId) => console.log(`[eval] ${id} (${defId})`),
+      onEvaluate: (id: string, defId: string) => console.log(`[eval] ${id} (${defId})`),
     });
 
-    // Rebuild RF state from the loaded graph + layout.
     const positions = parsed.layout?.positions ?? {};
     const newRfNodes: Node[] = [];
     for (const [id] of nextGraph.nodes) {
@@ -390,9 +437,32 @@ export function App() {
     setRfEdges(newRfEdges);
 
     if (parsed.layout?.nextPos) nextPos.current = { ...parsed.layout.nextPos };
-
     runEval();
   }, [toRfNode, runEval, setRfNodes, setRfEdges]);
+
+  const handleLoadFile = useCallback(async (file: File) => {
+    let parsed: { formatVersion?: number } & LoadedFile;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      alert(`Load failed: not valid JSON (${(e as Error).message})`);
+      return;
+    }
+    if (parsed.formatVersion !== 1) {
+      alert(`Load failed: unsupported formatVersion ${parsed.formatVersion}`);
+      return;
+    }
+    if (!parsed.graph) {
+      alert('Load failed: file has no graph');
+      return;
+    }
+    pushUndo();
+    try {
+      applyGraphData(parsed);
+    } catch (e) {
+      alert(`Load failed: ${(e as Error).message}`);
+    }
+  }, [applyGraphData, pushUndo]);
 
   const handleLoadClick = useCallback(() => {
     loadInputRef.current?.click();
@@ -403,13 +473,67 @@ export function App() {
     (deleted) => {
       const graph = graphRef.current;
       if (!graph) return;
+      pushUndo();
       for (const e of deleted) {
         if (e.targetHandle) { graph.disconnect(e.target, e.targetHandle); evalRef.current?.markDirty(e.target); }
       }
       runEval();
     },
-    [runEval],
+    [runEval, pushUndo],
   );
+
+  // ── Undo / Redo handlers ────────────────────────────────────
+  const handleUndo = useCallback(() => {
+    const undoStack = undoStackRef.current;
+    if (undoStack.length === 0) return;
+    const current = captureSnapshot();
+    const prev = undoStack.pop()!;
+    if (current) redoStackRef.current.push(current);
+    restoringRef.current = true;
+    try {
+      const parsed = JSON.parse(prev);
+      applyGraphData(parsed);
+    } catch (e) {
+      console.warn('Undo failed:', e);
+    } finally {
+      restoringRef.current = false;
+    }
+  }, [captureSnapshot, applyGraphData]);
+
+  const handleRedo = useCallback(() => {
+    const redoStack = redoStackRef.current;
+    if (redoStack.length === 0) return;
+    const current = captureSnapshot();
+    const next = redoStack.pop()!;
+    if (current) undoStackRef.current.push(current);
+    restoringRef.current = true;
+    try {
+      const parsed = JSON.parse(next);
+      applyGraphData(parsed);
+    } catch (e) {
+      console.warn('Redo failed:', e);
+    } finally {
+      restoringRef.current = false;
+    }
+  }, [captureSnapshot, applyGraphData]);
+
+  // Cmd/Ctrl-Z and Cmd/Ctrl-Shift-Z global keybindings. We skip
+  // when the focused element is an <input> or <textarea> so the
+  // browser's native input undo (for the number/text fields on
+  // CadNode) still works inside those.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.key.toLowerCase() !== 'z') return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      e.preventDefault();
+      if (e.shiftKey) handleRedo();
+      else handleUndo();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [handleUndo, handleRedo]);
 
   // Accordion state — all groups open by default
   const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(PALETTE.map((g) => g.label)));
@@ -529,6 +653,18 @@ export function App() {
             e.target.value = '';
           }}
         />
+        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+          <button
+            onClick={handleUndo}
+            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
+            title="Undo (Cmd/Ctrl-Z)"
+          >↶ Undo</button>
+          <button
+            onClick={handleRedo}
+            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
+            title="Redo (Cmd/Ctrl-Shift-Z)"
+          >↷ Redo</button>
+        </div>
         <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
           <button
             onClick={handleSave}
