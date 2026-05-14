@@ -25,6 +25,8 @@ import type { NodeRegistry, GraphData } from 'knot-cad/graph';
 import { FormView } from 'knot-cad/react';
 
 import { CadNode, type CadNodeData } from './CadNode';
+import { portColor } from './port-colors';
+import { EXAMPLES } from './examples';
 
 // ── Tour ────────────────────────────────────────────────────────
 const TOUR_STEPS: Step[] = [
@@ -187,11 +189,14 @@ export function App() {
     await ev.run(graph);
 
     const newMeshes: MeshData[] = [];
+    const previewMap: Record<string, Record<string, { text: string; error?: boolean }>> = {};
     for (const [id] of graph.nodes) {
       const def = graph.getDef(id);
+      const nodePrev: Record<string, { text: string; error?: boolean }> = {};
       for (const port of Object.keys(def.outputs)) {
         const out = ev.getOutput(id, port);
         if (!out) continue;
+        nodePrev[port] = formatPortPreview(out);
         if (out.kind === 'brep') {
           try { newMeshes.push((out.value as any).tessellate()); } catch { /* skip */ }
         } else if (out.kind === 'list' && Array.isArray(out.value)) {
@@ -202,9 +207,20 @@ export function App() {
           }
         }
       }
+      previewMap[id] = nodePrev;
     }
     setMeshes(newMeshes);
-  }, []);
+    // Splice previews into each node's data so CadNode re-renders
+    // with the new values. Skip if previews are identical to avoid
+    // a needless RF reconciliation churn.
+    setRfNodes((nds) => nds.map((n) => {
+      const next = previewMap[n.id] ?? {};
+      const data = n.data as unknown as CadNodeData;
+      const cur = data.previews ?? {};
+      if (previewsEqual(cur, next)) return n;
+      return { ...n, data: { ...data, previews: next } as unknown as Record<string, unknown> };
+    }));
+  }, [setRfNodes]);
 
   // ── Undo / Redo ──────────────────────────────────────────────
   //
@@ -254,6 +270,32 @@ export function App() {
     if (stack.length > UNDO_LIMIT) stack.shift();
     redoStackRef.current.length = 0;
   }, [captureSnapshot]);
+
+  // ── Wire-color helpers ───────────────────────────────────────
+  //
+  // The edge's stroke color is derived from the source port's kind
+  // so a glance at the canvas tells you what's flowing where —
+  // yellow for lists, orange for breps, purple for curves, etc.
+  const edgeStyleFor = useCallback((fromNode: string, fromPort: string) => {
+    const graph = graphRef.current;
+    if (!graph) return { strokeWidth: 2 };
+    try {
+      const kind = graph.getDef(fromNode).outputs[fromPort]?.kind ?? 'number';
+      return { strokeWidth: 2, stroke: portColor(kind) };
+    } catch {
+      return { strokeWidth: 2 };
+    }
+  }, []);
+
+  const wireToEdge = useCallback(
+    (w: { fromNode: string; fromPort: string; toNode: string; toPort: string }): Edge => ({
+      id: `${w.fromNode}.${w.fromPort}-${w.toNode}.${w.toPort}`,
+      source: w.fromNode, sourceHandle: w.fromPort,
+      target: w.toNode, targetHandle: w.toPort,
+      style: edgeStyleFor(w.fromNode, w.fromPort),
+    }),
+    [edgeStyleFor],
+  );
 
   // ── Graph node → RF node ─────────────────────────────────────
   const toRfNode = useCallback(
@@ -332,11 +374,11 @@ export function App() {
         undoStackRef.current.pop();
         return;
       }
-      setRfEdges((eds) => addEdge(conn, eds));
+      setRfEdges((eds) => addEdge({ ...conn, style: edgeStyleFor(conn.source!, conn.sourceHandle!) }, eds));
       evalRef.current?.markDirty(conn.target);
       runEval();
     },
-    [runEval, pushUndo, setRfEdges],
+    [runEval, pushUndo, setRfEdges, edgeStyleFor],
   );
 
   // ── Delete nodes ─────────────────────────────────────────────
@@ -346,14 +388,10 @@ export function App() {
       if (!graph) return;
       pushUndo();
       for (const n of deleted) { evalRef.current?.evict(n.id); graph.removeNode(n.id); }
-      setRfEdges(graph.wires.map((w) => ({
-        id: `${w.fromNode}.${w.fromPort}-${w.toNode}.${w.toPort}`,
-        source: w.fromNode, sourceHandle: w.fromPort,
-        target: w.toNode, targetHandle: w.toPort,
-      })));
+      setRfEdges(graph.wires.map(wireToEdge));
       runEval();
     },
-    [runEval, pushUndo, setRfEdges],
+    [runEval, pushUndo, setRfEdges, wireToEdge],
   );
 
   // ── Save / Load ──────────────────────────────────────────────
@@ -428,17 +466,13 @@ export function App() {
       const pos = positions[id] ?? { x: 50 + newRfNodes.length * 30, y: 50 + newRfNodes.length * 40 };
       newRfNodes.push(toRfNode(id, pos));
     }
-    const newRfEdges: Edge[] = nextGraph.wires.map((w) => ({
-      id: `${w.fromNode}.${w.fromPort}-${w.toNode}.${w.toPort}`,
-      source: w.fromNode, sourceHandle: w.fromPort,
-      target: w.toNode, targetHandle: w.toPort,
-    }));
+    const newRfEdges: Edge[] = nextGraph.wires.map(wireToEdge);
     setRfNodes(newRfNodes);
     setRfEdges(newRfEdges);
 
     if (parsed.layout?.nextPos) nextPos.current = { ...parsed.layout.nextPos };
     runEval();
-  }, [toRfNode, runEval, setRfNodes, setRfEdges]);
+  }, [toRfNode, runEval, setRfNodes, setRfEdges, wireToEdge]);
 
   const handleLoadFile = useCallback(async (file: File) => {
     let parsed: { formatVersion?: number } & LoadedFile;
@@ -545,6 +579,18 @@ export function App() {
     });
   }, []);
 
+  // Palette search. While `paletteQuery` is non-empty, the palette
+  // shows only matching entries and force-expands any group that
+  // has any. Empty query falls back to the user's accordion state.
+  const [paletteQuery, setPaletteQuery] = useState('');
+  const filteredPalette = (() => {
+    const q = paletteQuery.trim().toLowerCase();
+    if (!q) return PALETTE.map((g) => ({ group: g, entries: g.entries }));
+    return PALETTE
+      .map((g) => ({ group: g, entries: g.entries.filter((e) => e.label.toLowerCase().includes(q)) }))
+      .filter((g) => g.entries.length > 0);
+  })();
+
   // Editor / Form mode toggle.
   //
   // Form mode hides the palette + node canvas and renders only the
@@ -552,6 +598,22 @@ export function App() {
   // as a tunable "definition" with someone who doesn't need to see
   // the wiring.
   const [mode, setMode] = useState<'editor' | 'form'>('editor');
+
+  // Examples dropdown state. Loading an example funnels through
+  // `applyGraphData` (the same path Load uses) so undo/redo, the
+  // RF layout, and evaluator re-init all work identically.
+  const [showExamples, setShowExamples] = useState(false);
+  const handleLoadExample = useCallback((id: string) => {
+    const ex = EXAMPLES.find((e) => e.id === id);
+    if (!ex) return;
+    pushUndo();
+    setShowExamples(false);
+    try {
+      applyGraphData(ex.file);
+    } catch (e) {
+      alert(`Example load failed: ${(e as Error).message}`);
+    }
+  }, [applyGraphData, pushUndo]);
 
   // Tour state
   const [runTour, setRunTour] = useState(false);
@@ -677,6 +739,38 @@ export function App() {
             title="Load a previously saved graph"
           >Load</button>
         </div>
+        <div style={{ position: 'relative', marginBottom: 6 }}>
+          <button
+            onClick={() => setShowExamples((s) => !s)}
+            style={{ width: '100%', background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', fontSize: 11, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+            title="Load a built-in example graph"
+          >
+            <span>Examples</span>
+            <span style={{ color: '#888' }}>▾</span>
+          </button>
+          {showExamples && (
+            <div style={{
+              position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 2,
+              background: '#1a1a2e', border: '1px solid #555', borderRadius: 4,
+              zIndex: 50, padding: 4, display: 'flex', flexDirection: 'column', gap: 2,
+              boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+            }}>
+              {EXAMPLES.map((ex) => (
+                <button
+                  key={ex.id}
+                  onClick={() => handleLoadExample(ex.id)}
+                  title={ex.description}
+                  style={{ background: 'transparent', border: 'none', borderRadius: 3, color: '#e0e0e0', padding: '5px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#2a2a3e'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+                >
+                  <div style={{ fontWeight: 600 }}>{ex.label}</div>
+                  <div style={{ color: '#888', fontSize: 10, marginTop: 1 }}>{ex.description}</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <span style={{ fontWeight: 700, fontSize: 14 }}>Add Node</span>
           <button
@@ -685,9 +779,24 @@ export function App() {
             title="Take a guided tour"
           >?</button>
         </div>
+        <input
+          type="search"
+          placeholder="Search nodes…"
+          value={paletteQuery}
+          onChange={(e) => setPaletteQuery(e.target.value)}
+          style={{
+            background: '#1a1a2e', border: '1px solid #444', borderRadius: 4,
+            color: '#e0e0e0', padding: '4px 8px', fontSize: 11, marginBottom: 6,
+          }}
+        />
         <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {PALETTE.map((group) => {
-            const isOpen = openGroups.has(group.label);
+          {filteredPalette.length === 0 && (
+            <div style={{ color: '#666', fontSize: 11, padding: '8px 0', textAlign: 'center' }}>
+              No nodes match “{paletteQuery}”
+            </div>
+          )}
+          {filteredPalette.map(({ group, entries }) => {
+            const isOpen = paletteQuery.trim() ? true : openGroups.has(group.label);
             return (
               <div key={group.label} data-tour={`palette-${group.label.toLowerCase()}`}>
                 <button
@@ -704,7 +813,7 @@ export function App() {
                 </button>
                 {isOpen && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingLeft: 2 }}>
-                    {group.entries.map((p) => (
+                    {entries.map((p) => (
                       <button
                         key={p.defId}
                         onClick={() => addNode(p.defId)}
@@ -742,6 +851,52 @@ export function App() {
       {viewport}
     </div>
   );
+}
+
+// ── Output preview formatting ────────────────────────────────────
+//
+// `out` is whatever `Evaluator.getOutput` returns — a Port
+// `{ kind, value }` for success, or an error record with a
+// `message` field. We render a compact, type-aware label next to
+// each output port so the user can see scalar values, list lengths,
+// and error states without opening devtools.
+function formatPortPreview(out: { kind: string; value?: unknown; message?: string }): { text: string; error?: boolean } {
+  if (out.kind === 'error') return { text: out.message ?? 'error', error: true };
+  const v = out.value;
+  switch (out.kind) {
+    case 'number': {
+      const n = v as number;
+      if (!Number.isFinite(n)) return { text: String(n) };
+      return { text: Number.isInteger(n) ? String(n) : n.toFixed(3) };
+    }
+    case 'bool': return { text: v ? 'true' : 'false' };
+    case 'vec3': {
+      const a = v as { x: number; y: number; z: number };
+      return { text: `(${a.x.toFixed(1)}, ${a.y.toFixed(1)}, ${a.z.toFixed(1)})` };
+    }
+    case 'list': {
+      const arr = (v as unknown[]) ?? [];
+      if (arr.length === 0) return { text: '[]' };
+      const first = arr[0];
+      const hint = typeof first === 'number' ? 'num' :
+                   typeof first === 'boolean' ? 'bool' :
+                   first && typeof first === 'object' ? 'obj' : 'val';
+      return { text: `[${arr.length} ${hint}]` };
+    }
+    case 'brep': return { text: 'brep' };
+    case 'curve': return { text: 'curve' };
+    default: return { text: out.kind };
+  }
+}
+
+function previewsEqual(a: Record<string, { text: string; error?: boolean }>, b: Record<string, { text: string; error?: boolean }>): boolean {
+  const ak = Object.keys(a), bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    const av = a[k], bv = b[k];
+    if (!bv || av.text !== bv.text || !!av.error !== !!bv.error) return false;
+  }
+  return true;
 }
 
 // ── Mesh renderer ────────────────────────────────────────────────

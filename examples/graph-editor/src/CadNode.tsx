@@ -8,6 +8,12 @@ export interface CadNodeData {
   outputs: { name: string; kind: string }[];
   constants: Record<string, unknown>;
   onConstantChange?: (port: string, value: unknown) => void;
+  /**
+   * Short, human-readable summary of each output port's computed
+   * value after the last eval. Keyed by port name. Used purely for
+   * display — never round-tripped to the kernel.
+   */
+  previews?: Record<string, { text: string; error?: boolean }>;
 }
 
 /** Custom React Flow node for CAD graph operations. */
@@ -120,14 +126,30 @@ export function CadNode({ data, selected }: NodeProps & { data: CadNodeData }) {
             </div>
           );
         })}
-        {data.outputs.map((out) => (
-          <div key={`out-${out.name}`} style={{ position: 'relative', padding: '3px 16px 3px 10px', textAlign: 'right' }}>
-            <Handle type="source" position={Position.Right} id={out.name}
-              style={{ background: portColor(out.kind), width: 10, height: 10, border: '2px solid #1a1a2e', top: '50%' }}
-            />
-            <span style={{ color: '#aaa' }}>{out.name}</span>
-          </div>
-        ))}
+        {data.outputs.map((out) => {
+          const preview = data.previews?.[out.name];
+          return (
+            <div key={`out-${out.name}`} style={{ position: 'relative', padding: '3px 16px 3px 10px', textAlign: 'right' }}>
+              <Handle type="source" position={Position.Right} id={out.name}
+                style={{ background: portColor(out.kind), width: 10, height: 10, border: '2px solid #1a1a2e', top: '50%' }}
+              />
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                {preview ? (
+                  <span
+                    title={preview.error ? preview.text : undefined}
+                    style={{
+                      color: preview.error ? '#ff6666' : '#666',
+                      fontSize: 10, fontFamily: 'monospace',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      maxWidth: 90, textAlign: 'left', flex: 1,
+                    }}
+                  >{preview.error ? '⚠ error' : `→ ${preview.text}`}</span>
+                ) : <span style={{ flex: 1 }} />}
+                <span style={{ color: '#aaa' }}>{out.name}</span>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
