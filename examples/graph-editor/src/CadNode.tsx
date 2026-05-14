@@ -18,16 +18,28 @@ export interface CadNodeData {
 
 /** Custom React Flow node for CAD graph operations. */
 export function CadNode({ data, selected }: NodeProps & { data: CadNodeData }) {
-  const borderColor = selected ? '#fff' : '#444';
   const isSlider = data.defId === 'core.slider';
   const isToggle = data.defId === 'core.toggle';
   const isExpression = data.defId === 'math.expression';
+
+  // First errored output determines the badge tooltip + ring color.
+  // We surface only the first error to avoid stacking — clicking
+  // into the node and inspecting the offending output's per-port
+  // preview gives the full picture.
+  const erroredEntry = data.previews
+    ? Object.entries(data.previews).find(([, p]) => p.error)
+    : undefined;
+  const hasError = !!erroredEntry;
+  const errorMsg = erroredEntry?.[1].text;
+
+  const borderColor = hasError ? '#ff6666' : (selected ? '#fff' : '#444');
 
   return (
     <div
       style={{
         background: '#2a2a3e',
         border: `1px solid ${borderColor}`,
+        boxShadow: hasError ? '0 0 0 1px rgba(255, 100, 100, 0.35)' : undefined,
         borderRadius: 6,
         minWidth: isSlider ? 200 : 160,
         fontSize: 12,
@@ -36,8 +48,17 @@ export function CadNode({ data, selected }: NodeProps & { data: CadNodeData }) {
       }}
     >
       {/* Header */}
-      <div style={{ padding: '6px 10px', borderBottom: '1px solid #444', fontWeight: 600, fontSize: 13 }}>
-        {data.label}
+      <div
+        style={{
+          padding: '6px 10px', borderBottom: '1px solid #444',
+          fontWeight: 600, fontSize: 13,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}
+      >
+        <span>{data.label}</span>
+        {hasError && (
+          <span title={errorMsg} style={{ color: '#ff6666', fontSize: 12, cursor: 'help' }}>⚠</span>
+        )}
       </div>
 
       {/* Slider body */}

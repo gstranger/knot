@@ -13,6 +13,7 @@ import {
   type NodeTypes,
   type OnNodesDelete,
   type OnEdgesDelete,
+  type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { Canvas } from '@react-three/fiber';
@@ -329,8 +330,12 @@ export function App() {
   );
 
   // ── Add node ─────────────────────────────────────────────────
+  //
+  // `at` overrides the cascading-diagonal default position — used
+  // by the right-click context menu to drop the node where the
+  // cursor was.
   const addNode = useCallback(
-    (defId: string) => {
+    (defId: string, at?: { x: number; y: number }) => {
       const graph = graphRef.current;
       if (!graph) return;
       const def = graph.registry.get(defId);
@@ -351,8 +356,13 @@ export function App() {
       }
       pushUndo();
       const nodeId = graph.addNode(defId, constants);
-      const pos = { ...nextPos.current };
-      nextPos.current = { x: pos.x + 30, y: pos.y + 40 };
+      let pos: { x: number; y: number };
+      if (at) {
+        pos = at;
+      } else {
+        pos = { ...nextPos.current };
+        nextPos.current = { x: pos.x + 30, y: pos.y + 40 };
+      }
       setRfNodes((nds) => [...nds, toRfNode(nodeId, pos)]);
       runEval();
     },
@@ -551,23 +561,62 @@ export function App() {
     }
   }, [captureSnapshot, applyGraphData]);
 
-  // Cmd/Ctrl-Z and Cmd/Ctrl-Shift-Z global keybindings. We skip
-  // when the focused element is an <input> or <textarea> so the
-  // browser's native input undo (for the number/text fields on
-  // CadNode) still works inside those.
+  // Duplicate selected nodes. Each duplicate is a fresh kernel node
+  // (new id, copied constants) offset by (30, 30) from its source
+  // so it doesn't sit perfectly on top. Wires aren't cloned —
+  // matches Grasshopper/Blender's "node-only" Cmd-D semantics.
+  const handleDuplicate = useCallback(() => {
+    const graph = graphRef.current;
+    if (!graph) return;
+    const selected = rfNodes.filter((n) => n.selected);
+    if (selected.length === 0) return;
+    pushUndo();
+    const created: Node[] = [];
+    for (const n of selected) {
+      const inst = graph.getNode(n.id);
+      if (!inst) continue;
+      const newId = graph.addNode(inst.defId, { ...inst.constants });
+      const pos = { x: n.position.x + 30, y: n.position.y + 30 };
+      created.push(toRfNode(newId, pos));
+    }
+    if (created.length === 0) return;
+    // Deselect the originals so the duplicates become the new
+    // selection — a second Cmd-D then duplicates those, like every
+    // other editor.
+    setRfNodes((nds) => [
+      ...nds.map((n) => (n.selected ? { ...n, selected: false } : n)),
+      ...created.map((n) => ({ ...n, selected: true })),
+    ]);
+    runEval();
+  }, [rfNodes, toRfNode, pushUndo, setRfNodes, runEval]);
+
+  // Cmd/Ctrl-Z, Cmd/Ctrl-Shift-Z, Cmd/Ctrl-S, Cmd/Ctrl-D global
+  // keybindings. We skip when the focused element is an <input> or
+  // <textarea> so the browser's native input behavior (cursor undo,
+  // text duplication via Cmd-D in some browsers) still works inside
+  // those.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (!mod || e.key.toLowerCase() !== 'z') return;
+      if (!mod) return;
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      e.preventDefault();
-      if (e.shiftKey) handleRedo();
-      else handleUndo();
+      const key = e.key.toLowerCase();
+      if (key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+      } else if (key === 's' && !e.shiftKey) {
+        e.preventDefault();
+        handleSave();
+      } else if (key === 'd' && !e.shiftKey) {
+        e.preventDefault();
+        handleDuplicate();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [handleUndo, handleRedo]);
+  }, [handleUndo, handleRedo, handleSave, handleDuplicate]);
 
   // Accordion state — all groups open by default
   const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(PALETTE.map((g) => g.label)));
@@ -598,6 +647,48 @@ export function App() {
   // as a tunable "definition" with someone who doesn't need to see
   // the wiring.
   const [mode, setMode] = useState<'editor' | 'form'>('editor');
+
+  // Right-click "add node" context menu.
+  //
+  // The RF instance gives us `screenToFlowPosition`, which translates
+  // a viewport click into canvas coords (accounting for pan/zoom),
+  // so the newly-added node lands exactly under the cursor. Without
+  // it a right-click far from the origin would still spawn nodes
+  // near (0, 0).
+  const rfRef = useRef<ReactFlowInstance | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ screenX: number; screenY: number; flowX: number; flowY: number } | null>(null);
+  const [ctxQuery, setCtxQuery] = useState('');
+  const onPaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
+    e.preventDefault();
+    const rf = rfRef.current;
+    if (!rf) return;
+    const flow = rf.screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    setCtxMenu({ screenX: e.clientX, screenY: e.clientY, flowX: flow.x, flowY: flow.y });
+    setCtxQuery('');
+  }, []);
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest('[data-ctx-menu]')) return;
+      setCtxMenu(null);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setCtxMenu(null); };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [ctxMenu]);
+  const ctxFiltered = (() => {
+    const q = ctxQuery.trim().toLowerCase();
+    if (!q) return PALETTE.map((g) => ({ group: g, entries: g.entries }));
+    return PALETTE
+      .map((g) => ({ group: g, entries: g.entries.filter((e) => e.label.toLowerCase().includes(q)) }))
+      .filter((g) => g.entries.length > 0);
+  })();
 
   // Examples dropdown state. Loading an example funnels through
   // `applyGraphData` (the same path Load uses) so undo/redo, the
@@ -837,6 +928,8 @@ export function App() {
           onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onNodesDelete={onNodesDelete} onEdgesDelete={onEdgesDelete}
+          onInit={(inst) => { rfRef.current = inst; }}
+          onPaneContextMenu={onPaneContextMenu}
           nodeTypes={nodeTypes}
           defaultEdgeOptions={{ style: { strokeWidth: 2 } }}
           fitView colorMode="dark" deleteKeyCode="Backspace"
@@ -849,6 +942,68 @@ export function App() {
 
       {/* 3D viewport */}
       {viewport}
+
+      {/* Right-click context menu */}
+      {ctxMenu && (
+        <div
+          data-ctx-menu
+          style={{
+            position: 'fixed',
+            // Clamp inside the viewport so a menu opened near the
+            // right/bottom edge stays fully visible. 240×360 matches
+            // the menu's intrinsic size below.
+            left: Math.min(ctxMenu.screenX, window.innerWidth - 240),
+            top: Math.min(ctxMenu.screenY, window.innerHeight - 360),
+            width: 240, maxHeight: 360,
+            background: '#1a1a2e', border: '1px solid #555', borderRadius: 4,
+            zIndex: 100, padding: 6, display: 'flex', flexDirection: 'column', gap: 4,
+            boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
+          }}
+        >
+          <input
+            type="search"
+            placeholder="Search nodes…"
+            autoFocus
+            value={ctxQuery}
+            onChange={(e) => setCtxQuery(e.target.value)}
+            style={{
+              background: '#16162a', border: '1px solid #444', borderRadius: 4,
+              color: '#e0e0e0', padding: '4px 8px', fontSize: 11,
+            }}
+          />
+          <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {ctxFiltered.length === 0 && (
+              <div style={{ color: '#666', fontSize: 11, padding: '8px 0', textAlign: 'center' }}>
+                No matches
+              </div>
+            )}
+            {ctxFiltered.map(({ group, entries }) => (
+              <div key={group.label}>
+                <div style={{
+                  color: '#888', fontSize: 9, textTransform: 'uppercase',
+                  letterSpacing: 1, padding: '4px 6px 2px',
+                }}>{group.label}</div>
+                {entries.map((p) => (
+                  <button
+                    key={p.defId}
+                    onClick={() => {
+                      addNode(p.defId, { x: ctxMenu.flowX, y: ctxMenu.flowY });
+                      setCtxMenu(null);
+                    }}
+                    style={{
+                      width: '100%', background: 'transparent', border: 'none',
+                      borderRadius: 3, color: '#e0e0e0', padding: '4px 8px',
+                      cursor: 'pointer', textAlign: 'left', fontSize: 11,
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#2a2a3e'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+                  >{p.label}</button>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
