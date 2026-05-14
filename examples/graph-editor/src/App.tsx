@@ -19,8 +19,12 @@ import '@xyflow/react/dist/style.css';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import { Joyride, type Step, type EventData, STATUS } from 'react-joyride';
+import {
+  HelpCircle, Undo2, Redo2, Save, FolderOpen,
+  BookOpen, Search, ChevronDown,
+} from 'lucide-react';
 
-import { createKnot, type Knot, type MeshData } from 'knot-cad';
+import { createKnot, type MeshData } from 'knot-cad';
 import { Graph, Evaluator, buildDefaultRegistry } from 'knot-cad/graph';
 import type { NodeRegistry, GraphData } from 'knot-cad/graph';
 import { FormView } from 'knot-cad/react';
@@ -29,13 +33,33 @@ import { CadNode, type CadNodeData } from './CadNode';
 import { portColor } from './port-colors';
 import { EXAMPLES } from './examples';
 
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import {
+  Accordion, AccordionContent, AccordionItem, AccordionTrigger,
+} from '@/components/ui/accordion';
+import {
+  Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
+} from '@/components/ui/command';
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Separator } from '@/components/ui/separator';
+
 // ── Tour ────────────────────────────────────────────────────────
 const TOUR_STEPS: Step[] = [
   {
     target: 'body',
     placement: 'center',
     title: 'Welcome to the Knot Graph Editor',
-    content: 'This is a node-based parametric CAD tool. You build 3D geometry by connecting nodes in a visual graph \u2014 similar to Grasshopper or Geometry Nodes.',
+    content: 'This is a node-based parametric CAD tool. You build 3D geometry by connecting nodes in a visual graph — similar to Grasshopper or Geometry Nodes.',
     skipBeacon: true,
   },
   {
@@ -66,7 +90,7 @@ const TOUR_STEPS: Step[] = [
     target: '[data-tour="graph-canvas"]',
     placement: 'left',
     title: 'Editing Tips',
-    content: 'Pan: drag the background. Zoom: scroll wheel. Select a node and press Backspace to delete it. Number inputs on nodes can be edited directly \u2014 just click and type.',
+    content: 'Pan: drag the background. Zoom: scroll wheel. Select a node and press Backspace to delete it. Number inputs on nodes can be edited directly — just click and type.',
   },
   {
     target: '[data-tour="viewport"]',
@@ -78,7 +102,7 @@ const TOUR_STEPS: Step[] = [
     target: 'body',
     placement: 'center',
     title: 'Try It: Subtract a Cylinder from a Box',
-    content: '1. Add a Box (Primitives \u203A Box)\n2. Add a Cylinder\n3. Add a Boolean (Operations \u203A Boolean)\n4. Connect the Box brep output \u2192 Boolean input "a"\n5. Connect the Cylinder brep output \u2192 Boolean input "b"\n6. Set Boolean "op" to 2 (subtraction)\n\nThe cylinder is cut from the box in the viewport!',
+    content: '1. Add a Box (Primitives › Box)\n2. Add a Cylinder\n3. Add a Boolean (Operations › Boolean)\n4. Connect the Box brep output → Boolean input "a"\n5. Connect the Cylinder brep output → Boolean input "b"\n6. Set Boolean "op" to 2 (subtraction)\n\nThe cylinder is cut from the box in the viewport!',
   },
 ];
 
@@ -163,6 +187,14 @@ export function App() {
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([] as Edge[]);
   const nextPos = useRef({ x: 50, y: 50 });
 
+  // Error dialog replaces native alert(). One queue, shown one at
+  // a time — keeps the UX consistent with the rest of the shadcn
+  // surface.
+  const [errorDialog, setErrorDialog] = useState<{ title: string; message: string } | null>(null);
+  const showError = useCallback((title: string, message: string) => {
+    setErrorDialog({ title, message });
+  }, []);
+
   // ── Init ─────────────────────────────────────────────────────
   useEffect(() => {
     let disposed = false;
@@ -211,9 +243,6 @@ export function App() {
       previewMap[id] = nodePrev;
     }
     setMeshes(newMeshes);
-    // Splice previews into each node's data so CadNode re-renders
-    // with the new values. Skip if previews are identical to avoid
-    // a needless RF reconciliation churn.
     setRfNodes((nds) => nds.map((n) => {
       const next = previewMap[n.id] ?? {};
       const data = n.data as unknown as CadNodeData;
@@ -224,20 +253,9 @@ export function App() {
   }, [setRfNodes]);
 
   // ── Undo / Redo ──────────────────────────────────────────────
-  //
-  // Snapshot-based: every mutation pushes the current graph state
-  // onto an undo stack before running. Cmd-Z pops, restores, and
-  // pushes the previous state onto a redo stack. Cmd-Shift-Z does
-  // the reverse.
-  //
-  // Snapshots are full `Graph.toJSON()` serializations plus the
-  // editor's RF node positions, so visual layout round-trips too.
-  // Stack capped at UNDO_LIMIT entries to bound memory.
   const undoStackRef = useRef<string[]>([]);
   const redoStackRef = useRef<string[]>([]);
   const UNDO_LIMIT = 50;
-  // Set while applying a snapshot so any cascading mutation hooks
-  // don't push themselves onto the undo stack and corrupt redo.
   const restoringRef = useRef(false);
 
   const captureSnapshot = useCallback((): string | null => {
@@ -255,9 +273,6 @@ export function App() {
         },
       });
     } catch {
-      // Non-JSON-safe constants — skip the snapshot. The mutation
-      // proceeds; undo will jump past this state but never lose
-      // earlier ones.
       return null;
     }
   }, [rfNodes]);
@@ -273,10 +288,6 @@ export function App() {
   }, [captureSnapshot]);
 
   // ── Wire-color helpers ───────────────────────────────────────
-  //
-  // The edge's stroke color is derived from the source port's kind
-  // so a glance at the canvas tells you what's flowing where —
-  // yellow for lists, orange for breps, purple for curves, etc.
   const edgeStyleFor = useCallback((fromNode: string, fromPort: string) => {
     const graph = graphRef.current;
     if (!graph) return { strokeWidth: 2 };
@@ -330,10 +341,6 @@ export function App() {
   );
 
   // ── Add node ─────────────────────────────────────────────────
-  //
-  // `at` overrides the cascading-diagonal default position — used
-  // by the right-click context menu to drop the node where the
-  // cursor was.
   const addNode = useCallback(
     (defId: string, at?: { x: number; y: number }) => {
       const graph = graphRef.current;
@@ -344,13 +351,11 @@ export function App() {
       for (const [name, spec] of Object.entries(def.inputs) as [string, any][]) {
         if (spec.default !== undefined) constants[name] = spec.default;
       }
-      // Slider metadata defaults.
       if (defId === 'core.slider') {
         constants._min ??= 0;
         constants._max ??= 10;
         constants._step ??= 0.1;
       }
-      // Expression default.
       if (defId === 'math.expression') {
         constants.expr ??= 'a';
       }
@@ -378,9 +383,6 @@ export function App() {
       try { graph.connect(conn.source, conn.sourceHandle, conn.target, conn.targetHandle); }
       catch (e) {
         console.warn('connect rejected:', (e as Error).message);
-        // Roll back the snapshot we just pushed — the user didn't
-        // actually mutate, so undo shouldn't bring them back to
-        // pre-attempt state.
         undoStackRef.current.pop();
         return;
       }
@@ -405,12 +407,6 @@ export function App() {
   );
 
   // ── Save / Load ──────────────────────────────────────────────
-  //
-  // File format: `{ formatVersion, graph: GraphData, layout }`.
-  // `graph` is the kernel's serializable form (nodes + wires +
-  // constants). `layout` carries the editor-only state — React Flow
-  // positions and the next-spawn cursor — so a reload puts every
-  // node back where the author dropped it.
   const handleSave = useCallback(() => {
     const graph = graphRef.current;
     if (!graph) return;
@@ -419,7 +415,7 @@ export function App() {
       graphData = graph.toJSON();
     } catch (e) {
       console.error('Save failed (non-JSON-safe constant?):', e);
-      alert(`Save failed: ${(e as Error).message}`);
+      showError('Save failed', (e as Error).message);
       return;
     }
     const file = {
@@ -442,9 +438,8 @@ export function App() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }, [rfNodes]);
+  }, [rfNodes, showError]);
 
-  // Hidden file input — clicking the Load button trips this.
   const loadInputRef = useRef<HTMLInputElement>(null);
 
   type LoadedFile = {
@@ -452,18 +447,12 @@ export function App() {
     layout?: { positions?: Record<string, { x: number; y: number }>; nextPos?: { x: number; y: number } };
   };
 
-  // Apply a parsed graph+layout to the editor. Shared by Load,
-  // Undo, and Redo — the only difference between them is how the
-  // snapshot got chosen. Throws on registry/wire/cycle errors;
-  // callers surface those to the user as appropriate.
   const applyGraphData = useCallback((parsed: LoadedFile) => {
     const registry = registryRef.current;
     const ev = evalRef.current;
     if (!registry || !ev) return;
     const nextGraph = Graph.fromJSON(parsed.graph, registry);
 
-    // Swap in the new graph; dispose the old evaluator so cached
-    // outputs keyed by old node ids don't leak.
     graphRef.current = nextGraph;
     ev.dispose();
     evalRef.current = new Evaluator({
@@ -489,30 +478,29 @@ export function App() {
     try {
       parsed = JSON.parse(await file.text());
     } catch (e) {
-      alert(`Load failed: not valid JSON (${(e as Error).message})`);
+      showError('Load failed', `Not valid JSON (${(e as Error).message})`);
       return;
     }
     if (parsed.formatVersion !== 1) {
-      alert(`Load failed: unsupported formatVersion ${parsed.formatVersion}`);
+      showError('Load failed', `Unsupported formatVersion ${parsed.formatVersion}`);
       return;
     }
     if (!parsed.graph) {
-      alert('Load failed: file has no graph');
+      showError('Load failed', 'File has no graph');
       return;
     }
     pushUndo();
     try {
       applyGraphData(parsed);
     } catch (e) {
-      alert(`Load failed: ${(e as Error).message}`);
+      showError('Load failed', (e as Error).message);
     }
-  }, [applyGraphData, pushUndo]);
+  }, [applyGraphData, pushUndo, showError]);
 
   const handleLoadClick = useCallback(() => {
     loadInputRef.current?.click();
   }, []);
 
-  // ── Delete edges ─────────────────────────────────────────────
   const onEdgesDelete: OnEdgesDelete = useCallback(
     (deleted) => {
       const graph = graphRef.current;
@@ -526,7 +514,6 @@ export function App() {
     [runEval, pushUndo],
   );
 
-  // ── Undo / Redo handlers ────────────────────────────────────
   const handleUndo = useCallback(() => {
     const undoStack = undoStackRef.current;
     if (undoStack.length === 0) return;
@@ -561,10 +548,6 @@ export function App() {
     }
   }, [captureSnapshot, applyGraphData]);
 
-  // Duplicate selected nodes. Each duplicate is a fresh kernel node
-  // (new id, copied constants) offset by (30, 30) from its source
-  // so it doesn't sit perfectly on top. Wires aren't cloned —
-  // matches Grasshopper/Blender's "node-only" Cmd-D semantics.
   const handleDuplicate = useCallback(() => {
     const graph = graphRef.current;
     if (!graph) return;
@@ -580,9 +563,6 @@ export function App() {
       created.push(toRfNode(newId, pos));
     }
     if (created.length === 0) return;
-    // Deselect the originals so the duplicates become the new
-    // selection — a second Cmd-D then duplicates those, like every
-    // other editor.
     setRfNodes((nds) => [
       ...nds.map((n) => (n.selected ? { ...n, selected: false } : n)),
       ...created.map((n) => ({ ...n, selected: true })),
@@ -590,11 +570,6 @@ export function App() {
     runEval();
   }, [rfNodes, toRfNode, pushUndo, setRfNodes, runEval]);
 
-  // Cmd/Ctrl-Z, Cmd/Ctrl-Shift-Z, Cmd/Ctrl-S, Cmd/Ctrl-D global
-  // keybindings. We skip when the focused element is an <input> or
-  // <textarea> so the browser's native input behavior (cursor undo,
-  // text duplication via Cmd-D in some browsers) still works inside
-  // those.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -618,19 +593,6 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [handleUndo, handleRedo, handleSave, handleDuplicate]);
 
-  // Accordion state — all groups open by default
-  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(PALETTE.map((g) => g.label)));
-  const toggleGroup = useCallback((label: string) => {
-    setOpenGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(label)) next.delete(label); else next.add(label);
-      return next;
-    });
-  }, []);
-
-  // Palette search. While `paletteQuery` is non-empty, the palette
-  // shows only matching entries and force-expands any group that
-  // has any. Empty query falls back to the user's accordion state.
   const [paletteQuery, setPaletteQuery] = useState('');
   const filteredPalette = (() => {
     const q = paletteQuery.trim().toLowerCase();
@@ -639,34 +601,25 @@ export function App() {
       .map((g) => ({ group: g, entries: g.entries.filter((e) => e.label.toLowerCase().includes(q)) }))
       .filter((g) => g.entries.length > 0);
   })();
+  // When the user is searching we force-open every matching group;
+  // when they're not, we let Accordion remember the user's choices.
+  const [openGroups, setOpenGroups] = useState<string[]>(() => PALETTE.map((g) => g.label));
+  const accordionValue = paletteQuery.trim()
+    ? filteredPalette.map((g) => g.group.label)
+    : openGroups;
 
-  // Editor / Form mode toggle.
-  //
-  // Form mode hides the palette + node canvas and renders only the
-  // exposed input controls + viewport — useful when sharing a graph
-  // as a tunable "definition" with someone who doesn't need to see
-  // the wiring.
   const [mode, setMode] = useState<'editor' | 'form'>('editor');
 
   // Right-click "add node" context menu.
-  //
-  // The RF instance gives us `screenToFlowPosition`, which translates
-  // a viewport click into canvas coords (accounting for pan/zoom),
-  // so the newly-added node lands exactly under the cursor. Without
-  // it a right-click far from the origin would still spawn nodes
-  // near (0, 0).
   const rfRef = useRef<ReactFlowInstance | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{ screenX: number; screenY: number; flowX: number; flowY: number } | null>(null);
-  const [ctxQuery, setCtxQuery] = useState('');
   const onPaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
     e.preventDefault();
     const rf = rfRef.current;
     if (!rf) return;
     const flow = rf.screenToFlowPosition({ x: e.clientX, y: e.clientY });
     setCtxMenu({ screenX: e.clientX, screenY: e.clientY, flowX: flow.x, flowY: flow.y });
-    setCtxQuery('');
   }, []);
-  // Close on outside click / Escape.
   useEffect(() => {
     if (!ctxMenu) return;
     const onDown = (e: MouseEvent) => {
@@ -682,31 +635,18 @@ export function App() {
       window.removeEventListener('keydown', onKey);
     };
   }, [ctxMenu]);
-  const ctxFiltered = (() => {
-    const q = ctxQuery.trim().toLowerCase();
-    if (!q) return PALETTE.map((g) => ({ group: g, entries: g.entries }));
-    return PALETTE
-      .map((g) => ({ group: g, entries: g.entries.filter((e) => e.label.toLowerCase().includes(q)) }))
-      .filter((g) => g.entries.length > 0);
-  })();
 
-  // Examples dropdown state. Loading an example funnels through
-  // `applyGraphData` (the same path Load uses) so undo/redo, the
-  // RF layout, and evaluator re-init all work identically.
-  const [showExamples, setShowExamples] = useState(false);
   const handleLoadExample = useCallback((id: string) => {
     const ex = EXAMPLES.find((e) => e.id === id);
     if (!ex) return;
     pushUndo();
-    setShowExamples(false);
     try {
       applyGraphData(ex.file);
     } catch (e) {
-      alert(`Example load failed: ${(e as Error).message}`);
+      showError('Example load failed', (e as Error).message);
     }
-  }, [applyGraphData, pushUndo]);
+  }, [applyGraphData, pushUndo, showError]);
 
-  // Tour state
   const [runTour, setRunTour] = useState(false);
   const handleTourEvent = useCallback((data: EventData) => {
     if (data.status === STATUS.FINISHED || data.status === STATUS.SKIPPED) {
@@ -715,11 +655,19 @@ export function App() {
   }, []);
 
   if (loading) {
-    return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', width: '100vw' }}>Loading kernel…</div>;
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-background text-muted-foreground">
+        Loading kernel…
+      </div>
+    );
   }
 
   const viewport = (
-    <div data-tour="viewport" style={{ flex: mode === 'form' ? 1 : undefined, width: mode === 'editor' ? 400 : undefined, borderLeft: '1px solid #333' }}>
+    <div
+      data-tour="viewport"
+      className="border-l border-border"
+      style={{ flex: mode === 'form' ? 1 : undefined, width: mode === 'editor' ? 400 : undefined }}
+    >
       <Canvas camera={{ position: [5, 5, 5], fov: 50 }}>
         <ambientLight intensity={0.4} />
         <directionalLight position={[5, 10, 5]} intensity={0.8} />
@@ -731,55 +679,36 @@ export function App() {
   );
 
   const modeToggle = (
-    <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 1000, display: 'flex', background: '#16162a', border: '1px solid #333', borderRadius: 6, padding: 2 }}>
-      {(['editor', 'form'] as const).map((m) => (
-        <button
-          key={m}
-          onClick={() => setMode(m)}
-          style={{
-            background: mode === m ? '#4a9eff' : 'transparent',
-            color: mode === m ? '#0e0e1a' : '#aaa',
-            border: 'none',
-            padding: '6px 14px',
-            borderRadius: 4,
-            cursor: 'pointer',
-            fontSize: 11,
-            fontWeight: 600,
-            textTransform: 'uppercase',
-            letterSpacing: 0.5,
-          }}
-          title={m === 'editor' ? 'Show palette + node canvas' : 'Hide the graph; expose only inputs'}
-        >
-          {m}
-        </button>
-      ))}
+    <div className="fixed top-3 right-3 z-50">
+      <Tabs value={mode} onValueChange={(v) => setMode(v as 'editor' | 'form')}>
+        <TabsList>
+          <TabsTrigger value="editor">Editor</TabsTrigger>
+          <TabsTrigger value="form">Form</TabsTrigger>
+        </TabsList>
+      </Tabs>
     </div>
   );
 
-  if (mode === 'form') {
-    return (
-      <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
-        {modeToggle}
-        <div style={{ width: 320, background: '#16162a', borderRight: '1px solid #333' }}>
-          {graphRef.current && (
-            <FormView
-              graph={graphRef.current}
-              title="Parameters"
-              onChange={(field) => {
-                evalRef.current?.markDirty(field.nodeId);
-                runEval();
-              }}
-              style={{ height: '100%' }}
-            />
-          )}
-        </div>
-        {viewport}
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+  const content = mode === 'form' ? (
+    <div className="flex h-screen w-screen bg-background text-foreground">
+      {modeToggle}
+      <aside className="w-80 border-r border-border bg-card">
+        {graphRef.current && (
+          <FormView
+            graph={graphRef.current}
+            title="Parameters"
+            onChange={(field) => {
+              evalRef.current?.markDirty(field.nodeId);
+              runEval();
+            }}
+            style={{ height: '100%' }}
+          />
+        )}
+      </aside>
+      {viewport}
+    </div>
+  ) : (
+    <div className="flex h-screen w-screen bg-background text-foreground">
       {modeToggle}
       <Joyride
         steps={TOUR_STEPS}
@@ -792,137 +721,161 @@ export function App() {
         textColor="#e0e0e0"
         overlayColor="rgba(0, 0, 0, 0.7)"
       />
+
       {/* Palette */}
-      <div data-tour="palette" style={{ width: 180, background: '#16162a', borderRight: '1px solid #333', padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <aside
+        data-tour="palette"
+        className="flex w-56 flex-col gap-2 border-r border-border bg-card p-3"
+      >
         <input
           ref={loadInputRef}
           type="file"
           accept="application/json,.json"
-          style={{ display: 'none' }}
+          className="hidden"
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) handleLoadFile(f);
-            // Reset so picking the same file again re-fires onChange.
             e.target.value = '';
           }}
         />
-        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-          <button
-            onClick={handleUndo}
-            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
-            title="Undo (Cmd/Ctrl-Z)"
-          >↶ Undo</button>
-          <button
-            onClick={handleRedo}
-            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
-            title="Redo (Cmd/Ctrl-Shift-Z)"
-          >↷ Redo</button>
+
+        {/* Toolbar — Undo / Redo */}
+        <div className="flex gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button onClick={handleUndo} variant="outline" size="sm" className="flex-1">
+                <Undo2 /> Undo
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Undo (⌘Z)</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button onClick={handleRedo} variant="outline" size="sm" className="flex-1">
+                <Redo2 /> Redo
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Redo (⇧⌘Z)</TooltipContent>
+          </Tooltip>
         </div>
-        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-          <button
-            onClick={handleSave}
-            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
-            title="Download graph as JSON"
-          >Save</button>
-          <button
-            onClick={handleLoadClick}
-            style={{ flex: 1, background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 0', cursor: 'pointer', fontSize: 11 }}
-            title="Load a previously saved graph"
-          >Load</button>
+
+        {/* Toolbar — Save / Load */}
+        <div className="flex gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button onClick={handleSave} variant="outline" size="sm" className="flex-1">
+                <Save /> Save
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Download graph as JSON (⌘S)</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button onClick={handleLoadClick} variant="outline" size="sm" className="flex-1">
+                <FolderOpen /> Load
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Load a saved graph</TooltipContent>
+          </Tooltip>
         </div>
-        <div style={{ position: 'relative', marginBottom: 6 }}>
-          <button
-            onClick={() => setShowExamples((s) => !s)}
-            style={{ width: '100%', background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', fontSize: 11, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-            title="Load a built-in example graph"
-          >
-            <span>Examples</span>
-            <span style={{ color: '#888' }}>▾</span>
-          </button>
-          {showExamples && (
-            <div style={{
-              position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 2,
-              background: '#1a1a2e', border: '1px solid #555', borderRadius: 4,
-              zIndex: 50, padding: 4, display: 'flex', flexDirection: 'column', gap: 2,
-              boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-            }}>
-              {EXAMPLES.map((ex) => (
-                <button
-                  key={ex.id}
-                  onClick={() => handleLoadExample(ex.id)}
-                  title={ex.description}
-                  style={{ background: 'transparent', border: 'none', borderRadius: 3, color: '#e0e0e0', padding: '5px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#2a2a3e'; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-                >
-                  <div style={{ fontWeight: 600 }}>{ex.label}</div>
-                  <div style={{ color: '#888', fontSize: 10, marginTop: 1 }}>{ex.description}</div>
-                </button>
-              ))}
-            </div>
-          )}
+
+        {/* Examples dropdown */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="outline" size="sm" className="w-full justify-between">
+              <span className="flex items-center gap-1.5"><BookOpen /> Examples</span>
+              <ChevronDown />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-56">
+            {EXAMPLES.map((ex) => (
+              <DropdownMenuItem
+                key={ex.id}
+                onSelect={() => handleLoadExample(ex.id)}
+                className="flex-col items-start gap-0.5"
+              >
+                <span className="font-medium">{ex.label}</span>
+                <span className="text-muted-foreground text-[10px]">{ex.description}</span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <Separator className="my-1" />
+
+        {/* Header + tour button */}
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-semibold">Add Node</span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button onClick={() => setRunTour(true)} variant="ghost" size="icon-xs">
+                <HelpCircle />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Take a guided tour</TooltipContent>
+          </Tooltip>
         </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <span style={{ fontWeight: 700, fontSize: 14 }}>Add Node</span>
-          <button
-            onClick={() => setRunTour(true)}
-            style={{ background: '#2a2a3e', border: '1px solid #555', borderRadius: 4, color: '#888', padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}
-            title="Take a guided tour"
-          >?</button>
+
+        {/* Search */}
+        <div className="relative">
+          <Search className="absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            type="search"
+            placeholder="Search nodes…"
+            value={paletteQuery}
+            onChange={(e) => setPaletteQuery(e.target.value)}
+            className="h-8 pl-7 text-xs"
+          />
         </div>
-        <input
-          type="search"
-          placeholder="Search nodes…"
-          value={paletteQuery}
-          onChange={(e) => setPaletteQuery(e.target.value)}
-          style={{
-            background: '#1a1a2e', border: '1px solid #444', borderRadius: 4,
-            color: '#e0e0e0', padding: '4px 8px', fontSize: 11, marginBottom: 6,
-          }}
-        />
-        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {filteredPalette.length === 0 && (
-            <div style={{ color: '#666', fontSize: 11, padding: '8px 0', textAlign: 'center' }}>
-              No nodes match “{paletteQuery}”
-            </div>
-          )}
-          {filteredPalette.map(({ group, entries }) => {
-            const isOpen = paletteQuery.trim() ? true : openGroups.has(group.label);
-            return (
-              <div key={group.label} data-tour={`palette-${group.label.toLowerCase()}`}>
-                <button
-                  onClick={() => toggleGroup(group.label)}
-                  style={{
-                    width: '100%', background: 'none', border: 'none', color: '#888',
-                    fontSize: 10, textTransform: 'uppercase', letterSpacing: 1,
-                    padding: '6px 0 4px', cursor: 'pointer', textAlign: 'left',
-                    display: 'flex', alignItems: 'center', gap: 4,
-                  }}
-                >
-                  <span style={{ display: 'inline-block', width: 10, fontSize: 8, transition: 'transform 0.15s', transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)' }}>&#9654;</span>
-                  {group.label}
-                </button>
-                {isOpen && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingLeft: 2 }}>
-                    {entries.map((p) => (
-                      <button
-                        key={p.defId}
-                        onClick={() => addNode(p.defId)}
-                        style={{ background: '#2a2a3e', border: '1px solid #444', borderRadius: 4, color: '#e0e0e0', padding: '4px 8px', cursor: 'pointer', textAlign: 'left', fontSize: 11 }}
-                      >
-                        {p.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
+
+        {/* Palette accordion */}
+        <ScrollArea className="flex-1 -mx-1">
+          <div className="px-1">
+            {filteredPalette.length === 0 ? (
+              <div className="py-2 text-center text-xs text-muted-foreground">
+                No nodes match “{paletteQuery}”
               </div>
-            );
-          })}
-        </div>
-      </div>
+            ) : (
+              <Accordion
+                type="multiple"
+                value={accordionValue}
+                onValueChange={(v) => { if (!paletteQuery.trim()) setOpenGroups(v); }}
+              >
+                {filteredPalette.map(({ group, entries }) => (
+                  <AccordionItem
+                    key={group.label}
+                    value={group.label}
+                    data-tour={`palette-${group.label.toLowerCase()}`}
+                    className="border-b-0"
+                  >
+                    <AccordionTrigger className="py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground hover:no-underline">
+                      {group.label}
+                    </AccordionTrigger>
+                    <AccordionContent className="pb-2">
+                      <div className="flex flex-col gap-1">
+                        {entries.map((p) => (
+                          <Button
+                            key={p.defId}
+                            onClick={() => addNode(p.defId)}
+                            variant="secondary"
+                            size="sm"
+                            className="h-7 justify-start text-xs"
+                          >
+                            {p.label}
+                          </Button>
+                        ))}
+                      </div>
+                    </AccordionContent>
+                  </AccordionItem>
+                ))}
+              </Accordion>
+            )}
+          </div>
+        </ScrollArea>
+      </aside>
 
       {/* Graph canvas */}
-      <div data-tour="graph-canvas" style={{ flex: 1 }}>
+      <div data-tour="graph-canvas" className="flex-1">
         <ReactFlow
           nodes={rfNodes} edges={rfEdges}
           onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
@@ -947,74 +900,63 @@ export function App() {
       {ctxMenu && (
         <div
           data-ctx-menu
+          className="fixed z-[100] w-60 overflow-hidden rounded-md border border-border bg-popover text-popover-foreground shadow-lg"
           style={{
-            position: 'fixed',
-            // Clamp inside the viewport so a menu opened near the
-            // right/bottom edge stays fully visible. 240×360 matches
-            // the menu's intrinsic size below.
             left: Math.min(ctxMenu.screenX, window.innerWidth - 240),
             top: Math.min(ctxMenu.screenY, window.innerHeight - 360),
-            width: 240, maxHeight: 360,
-            background: '#1a1a2e', border: '1px solid #555', borderRadius: 4,
-            zIndex: 100, padding: 6, display: 'flex', flexDirection: 'column', gap: 4,
-            boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
           }}
         >
-          <input
-            type="search"
-            placeholder="Search nodes…"
-            autoFocus
-            value={ctxQuery}
-            onChange={(e) => setCtxQuery(e.target.value)}
-            style={{
-              background: '#16162a', border: '1px solid #444', borderRadius: 4,
-              color: '#e0e0e0', padding: '4px 8px', fontSize: 11,
-            }}
-          />
-          <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {ctxFiltered.length === 0 && (
-              <div style={{ color: '#666', fontSize: 11, padding: '8px 0', textAlign: 'center' }}>
-                No matches
-              </div>
-            )}
-            {ctxFiltered.map(({ group, entries }) => (
-              <div key={group.label}>
-                <div style={{
-                  color: '#888', fontSize: 9, textTransform: 'uppercase',
-                  letterSpacing: 1, padding: '4px 6px 2px',
-                }}>{group.label}</div>
-                {entries.map((p) => (
-                  <button
-                    key={p.defId}
-                    onClick={() => {
-                      addNode(p.defId, { x: ctxMenu.flowX, y: ctxMenu.flowY });
-                      setCtxMenu(null);
-                    }}
-                    style={{
-                      width: '100%', background: 'transparent', border: 'none',
-                      borderRadius: 3, color: '#e0e0e0', padding: '4px 8px',
-                      cursor: 'pointer', textAlign: 'left', fontSize: 11,
-                    }}
-                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#2a2a3e'; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-                  >{p.label}</button>
-                ))}
-              </div>
-            ))}
-          </div>
+          <Command>
+            <CommandInput placeholder="Search nodes…" autoFocus />
+            <CommandList className="max-h-72">
+              <CommandEmpty>No matches</CommandEmpty>
+              {PALETTE.map((group) => (
+                <CommandGroup key={group.label} heading={group.label}>
+                  {group.entries.map((p) => (
+                    <CommandItem
+                      key={p.defId}
+                      value={`${group.label} ${p.label}`}
+                      onSelect={() => {
+                        addNode(p.defId, { x: ctxMenu.flowX, y: ctxMenu.flowY });
+                        setCtxMenu(null);
+                      }}
+                    >
+                      {p.label}
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              ))}
+            </CommandList>
+          </Command>
         </div>
       )}
     </div>
   );
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      {content}
+      <AlertDialog
+        open={errorDialog !== null}
+        onOpenChange={(open) => { if (!open) setErrorDialog(null); }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{errorDialog?.title ?? ''}</AlertDialogTitle>
+            <AlertDialogDescription className="break-words">
+              {errorDialog?.message ?? ''}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction onClick={() => setErrorDialog(null)}>OK</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </TooltipProvider>
+  );
 }
 
 // ── Output preview formatting ────────────────────────────────────
-//
-// `out` is whatever `Evaluator.getOutput` returns — a Port
-// `{ kind, value }` for success, or an error record with a
-// `message` field. We render a compact, type-aware label next to
-// each output port so the user can see scalar values, list lengths,
-// and error states without opening devtools.
 function formatPortPreview(out: { kind: string; value?: unknown; message?: string }): { text: string; error?: boolean } {
   if (out.kind === 'error') return { text: out.message ?? 'error', error: true };
   const v = out.value;
